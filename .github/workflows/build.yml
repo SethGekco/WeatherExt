@@ -1,0 +1,59 @@
+name: Build WeatherExt
+
+on:
+  push:
+    # Both, deliberately: the local branch is `master` (git init default) but
+    # GitHub created the repo with `main` as its default. Listening to only one
+    # means a push to the other silently runs no CI, which looks identical to
+    # "CI passed" if you are not watching.
+    branches: [ master, main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check Syringe hooks
+        shell: bash
+        run: |
+          curl -sSfL -o hooks.csv \
+            https://raw.githubusercontent.com/SethGekco/YR-Hook-Encyclopedia/main/registry/hooks.csv
+          python3 tools/check_hook_overlap.py hooks.csv src
+          python3 tools/check_hook_bounds.py --registry hooks.csv src
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install ATL
+        shell: pwsh
+        run: |
+          $src14 = "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231"
+          $dst14 = "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.29.30133"
+          if (Test-Path "$src14\atlmfc\include") {
+            Copy-Item "$src14\atlmfc\include\*" "$dst14\include\" -Force
+            Copy-Item "$src14\atlmfc\lib\x86\atls.lib" "$dst14\lib\x86\" -Force
+            Write-Host "ATL headers and atls.lib copied"
+          } else {
+            Write-Host "ATL source not found at expected path, trying alternatives..."
+            $vsWhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+            $vsPath = & $vsWhere -latest -property installationPath
+            $atlPath = Get-ChildItem "$vsPath\VC\Tools\MSVC" | Sort-Object Name -Descending | Select-Object -First 1
+            Write-Host "Found MSVC at: $($atlPath.FullName)"
+          }
+
+      - name: Build
+        run: msbuild WeatherExt.sln /p:Configuration=DevBuild /p:Platform=x86
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WeatherExt
+          path: |
+            DevBuild\WeatherExt.dll
+            DevBuild\WeatherExt.map

@@ -1,0 +1,6 @@
+[submodule "YRpp"]
+	path = YRpp
+	url = https://github.com/Phobos-developers/YRpp.git
+[submodule "Phobos"]
+	path = Phobos
+	url = https://github.com/Phobos-developers/Phobos.git
