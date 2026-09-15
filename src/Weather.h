@@ -2,38 +2,40 @@
 
 class CCINIClass;
 class WarheadTypeClass;
+class TechnoTypeClass;
 class TechnoClass;
 class HouseClass;
 
-// Phase 0: one synced global weather level.
+// P1: named meters + contributors.
 //
-// Mutation rules (multiplayer determinism): the level changes ONLY from
-// synced sim events -- warhead detonations and the per-frame decay tick.
-// Logging never feeds back into sim state.
+// A "weather system" is a named signed-integer meter in synced sim state. Many
+// meters coexist (the [WeatherSystems] registry). Contributors add to named
+// meters: warheads on detonation, technos passively over time. (SW-fired
+// contributions land in P2, alongside the SW-firing effect, because both share
+// the Fire_SW/Launch veto-seat design.)
+//
+// Determinism: meters mutate ONLY from synced events (detonations) and the
+// synced per-frame tick. Iteration is array-index order, math is integer.
 namespace Weather
 {
-	struct GlobalConfig
+	struct DllConfig
 	{
-		bool Enabled = false;   // no [Weather] section => DLL stays inert
-		int Initial = 0;
-		int Baseline = 0;
-		int Decay = 1;          // level units removed per DecayRate frames
-		int DecayRate = 15;     // frames between decay ticks
-		int MinLevel = 0;
-		int MaxLevel = 10000;
-		int LogInterval = 150;  // frames between periodic log lines (0 = off)
+		bool Enabled = false;     // no [Weather] section => DLL stays inert
+		int LogInterval = 150;    // frames between periodic log lines (0 = off)
+		double WeatherScale = 1.0; // global multiplier on every contributor amount
 	};
 
-	extern GlobalConfig Config;
-	extern int Level;
+	extern DllConfig Config;
 
-	// Present-only-update: absent keys keep their current values, so the
-	// rules / gamemode / map INI passes layer exactly like vanilla tags do.
-	void ReadGlobals(CCINIClass* pINI);
-
+	// Present-only-update everywhere: absent keys keep current values, so the
+	// rules / gamemode / map passes (and spawn.ini lobby overrides) layer.
+	void ReadGlobals(CCINIClass* pINI);       // [Weather] + [WeatherSystems] + per-meter sections
 	void ReadWarhead(WarheadTypeClass* pWH, CCINIClass* pINI);
+	void ReadTechnoType(TechnoTypeClass* pType, CCINIClass* pINI);
 
 	void OnDetonation(WarheadTypeClass* pWH, TechnoClass* pSource, HouseClass* pHouse);
-
 	void FrameTick();
+
+	// Read-only accessor for later effects / tests. Unknown name => 0.
+	int GetAmount(const char* meterName);
 }
