@@ -236,10 +236,12 @@ much. The difference between a superweapon and a reactor is *when* the delta is
 applied, and that is implied by the section type — not by a different key.
 
 ```ini
-; --- superweapon: delta applied once, each time it actually FIRES ---
+; --- superweapon: START delta on fire, optional FINISH delta after an interval ---
 [StormCloudSpecial]
 WeatherSystem.Types=StormCloudWeather,RadStorm,HeatWave,CruiseStorm,MeteorFall
-WeatherSystem.Amounts=1,24,-2,100,5      ; parallel to .Types
+WeatherSystem.Amounts=1,24,-2,100,5          ; applied at START (on fire); parallel to .Types
+WeatherSystem.Amounts.Finish=-1,-24,2,-100,0 ; applied at FINISH, per meter (optional)
+WeatherSystem.Interval=150                    ; frames between start and finish (see below)
 
 ; --- warhead: delta applied once, each time it DETONATES ---
 [NukeWH]
@@ -589,3 +591,91 @@ network-synced trigger engine that happens to ship a weather preset.
    immune, no interp" as a special case. Flag if you'd rather it lerp.
 3. **`WeatherScale` scope** — global over all meters (one slider) vs per-meter
    only. Leaning **both**: a global `WeatherScale` × optional per-meter scale.
+
+---
+
+# Design rev 2.2 — superweapons as timed meter *pulses* (Start / Finish)
+
+A superweapon should be able to push a meter one way when it **starts** and the
+other way when it **finishes**, with a user-set interval between — turning any SW
+into a temporary weather *event*. Raise a meter at start, hold it elevated for
+the interval (during which threshold effects like `Fire.*` are active), then drop
+it back at finish. Signs are free on both ends, so the mirror case works too: dip
+a meter at start (e.g. a "calm before the storm"), recover at finish.
+
+This extends the P2 SW-fired contributor; it does not touch warheads (instant, no
+finish) or technos (continuous, no discrete finish).
+
+## Keys
+
+```ini
+[SomeSpecial]
+WeatherSystem.Types=StormCloudWeather,RadStorm   ; which meters
+WeatherSystem.Amounts=100,-5                       ; START delta per meter (on fire)
+WeatherSystem.Amounts.Finish=-100,5                ; FINISH delta per meter (optional)
+WeatherSystem.Interval=150                          ; frames from start to finish
+```
+
+- **`WeatherSystem.Amounts`** is the START delta — identical to today's on-fire
+  contribution, so nothing existing changes.
+- **`WeatherSystem.Amounts.Finish`** is the FINISH delta, parallel to `.Types`.
+  Absent ⇒ no finish delta (a plain one-shot, exactly as now).
+- **`WeatherSystem.Interval`** is the gap in frames:
+  - `> 0` — finish deltas are scheduled for `fireFrame + Interval`. This is the
+    knob Rex asked for: the SW owns a window of length `Interval` during which the
+    meter sits at its raised (or lowered) value.
+  - `0` / absent — start and finish apply on the **same** frame (finish is
+    pointless with opposite signs; useful only if a mod wants a same-frame net).
+  - `auto` — use the SW's own effect duration where it has one
+    (`LightningStormDuration` and the like), so the meter window matches the
+    on-screen storm exactly. Falls back to instant for SWs with no duration.
+
+## Mechanism — a synced pending-finish queue
+
+At the SW-fire seat (P2, post-veto — "fire high, measure low"), apply the START
+deltas immediately, then if `Interval > 0` push one entry per meter onto a
+**pending-finish queue**:
+
+```
+struct PendingFinish { int finishFrame; int meterIdx; int amount; };
+std::vector<PendingFinish> pending;   // synced sim state
+```
+
+`FrameTick` (the `0x55B6B3` seat) drains every entry whose `finishFrame <=
+CurrentFrame`, applying its delta (scaled by `WeatherScale` at *schedule* time so
+a mid-window lobby change can't desync). Rules that keep it deterministic and
+lockstep-safe:
+
+- The queue is **saved/loaded** with the meters (encyclopedia `Savegame-Stream`);
+  a finish scheduled before a save must still fire after a load.
+- Drain in a **fixed order** (queue index), integer math only.
+- A **new game resets** the queue (like the meters themselves).
+- **Overlap is allowed and expected**: firing the SW again before its finish
+  stacks a second independent pulse. Each start/finish pair is self-contained, so
+  N rapid casts = N overlapping windows, which is the intuitive behaviour.
+- **Vetoed SWs schedule nothing** — because both the start delta and the
+  scheduling happen only on the post-veto path, an inhibited SW produces neither
+  a start bump nor a dangling finish.
+
+## Why this is more than weather
+
+The pulse is a general "timed event" primitive. Because a raised meter can gate
+`Fire.*`, a single SW cast can *open a firing window*: cast → meter jumps over a
+`Fire.Amounts` threshold → storms auto-fire for `Interval` frames → meter drops
+back below threshold → they stop. The SW becomes a "start an event that runs for
+a while and then ends" button, with the event content defined entirely by the
+meter's effect table. Zombie waves, price shocks, upgrade windows — all just an
+SW pulse plus whatever effect the threshold triggers.
+
+## Open questions (rev 2.2)
+
+1. **`Interval` unit** — frames (consistent with `Fire.Intervals`) with the same
+   optional `...AreMinutes` convenience, or minutes to match how SW durations
+   read in the INI? Leaning **frames + convenience flag**.
+2. **`auto` interval source** — for SWs with several timing fields
+   (deferment vs duration), which counts as the "window"? Leaning the
+   **active-effect duration** (e.g. `LightningStormDuration`), not deferment.
+3. **Finish on a meter that hit its clamp** — if the meter was capped at `Max`
+   during the window, should finish still subtract the full scheduled amount
+   (can overshoot below where it started) or only what was actually added?
+   Leaning **full scheduled amount** (simple, predictable, symmetric).
