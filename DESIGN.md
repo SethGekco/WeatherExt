@@ -411,3 +411,181 @@ Extends the Hook map above. Encyclopedia-first, findings returned after.
 4. **Meter visibility** — do players need to *see* the meter (a UI number / bar),
    or is it a felt, behind-the-scenes force? Affects whether P-later needs any
    render work.
+
+---
+
+# Design rev 2.1 — coexist with SuperWeaponExt, richer versus, CnCNet dials
+
+Three refinements from review: the SW-firing path must compose with our *own*
+inhibitor/designator DLL, the warhead-versus model should reach for maximum
+authoring control, and the whole thing should be drivable from CnCNet skirmish
+settings. "Max control, don't mind the complexity" is the brief.
+
+## A. Auto-fire routes through `Fire_SW`, not `Launch` — so SuperWeaponExt applies
+
+We extend inhibitors/designators ourselves in **SuperWeaponExt**, whose veto
+layer sits precisely on **`HouseClass::Fire_SW` (`0x4FAE50`)** — the universal
+launch funnel (17 call sites), network-synced because it's downstream of the
+event queue, carrying its own `SWExt.*` tag namespace beyond Antares'
+`SW.Inhibitors`/`SW.Designators`. `SuperClass::Launch` (`0x6CC390`) is *below*
+that veto.
+
+**Therefore weather auto-fire calls `HouseClass::Fire_SW(idx, cell)`
+(`0x4FAE50`), never `Launch` directly.** Firing at the funnel means a
+weather-triggered `LightningStormSpecial` is judged by Antares' checks **and**
+SuperWeaponExt's extended `SWExt.*` scopes (owner/allies/enemies/team radii,
+per-role power checks, veterancy-tiered radii) exactly as a player-fired one is.
+Calling `Launch` would silently bypass all of it.
+
+This imposes real structure on the auto-fire, all of it desirable:
+
+- **Firing house must own the `SuperClass`.** `HouseClass::FindSuperWeapon(type)`
+  locates it in the house's `Supers` vector. If the house doesn't have it,
+  `Fire.GrantToOwner=yes` adds it — which is the clean replacement for the old
+  dummy buildings whose *entire job* was to grant a house an SW via
+  LimboDelivery.
+- **A target cell is required**, and because inhibitors/designators are
+  *location*-based, the target choice interacts with the veto. New key
+  `Fire.Target=` with modes: `random`, `enemy` (weighted toward enemy bases),
+  `techno:<ID>` (near instances of a type — e.g. drop meteors on refineries),
+  `mapcenter`, `source` (where the meter was last driven up). Default `random`.
+- **Readiness is ours.** WeatherExt owns the cadence via `Fire.Intervals`, so it
+  force-readies the `SuperClass` (`SetReadiness`) then calls `Fire_SW`, letting
+  the funnel spend the charge. If the veto suppresses it, no charge is spent.
+- **A vetoed volley does not advance the limit** and retries next interval
+  (`Fire.VetoRetry=yes`, default): the storm is "trying" but held off by a
+  designator/inhibitor, which is the intended drama.
+
+**The elegant part — fire high, measure low.** WeatherExt has *two* SW touch
+points: it *fires* SWs (this effect) and it *reads* SW fires as meter
+contributions (`WeatherSystem.*` on an SW section). Put them at different depths:
+
+- **Fire** at `Fire_SW` (`0x4FAE50`) — so the veto can stop it.
+- **Contribute** at `SuperClass::Launch` (`0x6CC390`) — which only runs for SWs
+  that *survived* the veto.
+
+So a suppressed SW neither fires nor feeds the meter, automatically, with no
+cross-check code. (Both are shared addresses — SuperWeaponExt on `0x4FAE50`,
+frameworks around `0x6CC390` — so the hook-overlap CI check is mandatory, and
+our contribution handler must return 0 to keep the chain alive.)
+
+## B. Warhead vs armor — three authoring tiers, max control
+
+Custom armor types are a solved problem in the stack (Antares `[ArmorTypes]`,
+Verses as a growable per-warhead vector, `ArmorType_FindIndex` `0x4753F0`); the
+open question was how to *author* meter-driven versus changes well. Answer: three
+tiers, each strictly more expressive, all keyed by armor **name** and applied at
+the per-object damage seat.
+
+```ini
+[StormCloudWeather]
+Versus.Warheads=NukeWH,HE,Lightning
+
+; -- Tier A: one scalar for the whole warhead, grows with the meter --
+Versus.NukeWH.PerAmount=100
+Versus.NukeWH.Mult=0.10           ; factor = 1 + 0.10*steps (linear, clamped)
+Versus.NukeWH.MultMax=3.0
+
+; -- Tier B: per-armor response curve (surgical), armors by name --
+Versus.HE.PerAmount=50
+Versus.HE.Armors=none,light,heavy,special_1
+Versus.HE.Mult=0.0,0.05,0.20,0.50 ; per-armor mult added per step
+Versus.HE.Add=0%,0%,10%,25%       ; per-armor flat Verses added per step
+Versus.HE.Clamp=0%,500%
+
+; -- Tier C: KEYFRAMED Verses rows at amount thresholds, interpolated --
+;    the direct successor to the 33 StormDamage snapshots: author the whole
+;    armor row at chosen meter amounts, engine lerps between the keyframes.
+Versus.Lightning.Keyframes=0,15000,25000,50000
+Versus.Lightning.Armors=none,flak,plate,light,medium,heavy,wood,steel,concrete,special_1,special_2
+Versus.Lightning.Row.0=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%
+Versus.Lightning.Row.15000=250%,250%,250%,200%,250%,250%,60%,60%,60%,500%,250%
+Versus.Lightning.Row.25000=1000%,1000%,1000%,850%,1000%,1000%,250%,250%,250%,2000%,1000%
+Versus.Lightning.Row.50000=2000%,2000%,2000%,1700%,2000%,2000%,500%,500%,500%,4000%,2000%
+Versus.Lightning.Interp=linear    ; linear|step (step = hold last keyframe)
+```
+
+- **Tier C is the most control**: your 33 `StormDamage*` files were 33 frozen
+  points on exactly this curve; here they become keyframes of one continuous
+  function the meter sweeps. `Interp=step` reproduces the old discrete behaviour
+  exactly; `linear` makes the storm ramp smoothly.
+- **Precedence**: if a warhead declares Tier C, it *replaces* the Verses row for
+  that warhead (it's a full authored row). Otherwise Tier A and Tier B compose
+  (A scales the whole row, then B adjusts named armors). One warhead can't mix C
+  with A/B — C is absolute by design.
+- All tiers resolve armor columns by **name** at load, via `ArmorType_FindIndex`,
+  so adding an armor to `[ArmorTypes]` never shifts a column silently.
+
+## C. CnCNet skirmish-settings integration — one dial replaces a file family
+
+The CnCNet client wires a lobby control to the game two ways:
+`SpawnIniOption=<key>` writes one `key=value` into **spawn.ini**, while
+`CustomIniPath=<file>` **merges a whole INI file** when selected. The World
+Powers mod's ~1,770 Game Options files are the `CustomIniPath` approach at scale
+— one file per slider position.
+
+WeatherExt is built to flip every one of those into a single `SpawnIniOption`
+dial:
+
+- **Every meter tunable is one overridable key**, so a lobby dropdown can set it
+  directly. A "Weather Intensity: Off / Low / High / Chaos" dropdown becomes:
+
+  ```ini
+  ; client GameOptions.ini
+  [cmbWeatherIntensity]
+  Items=Off,Low,High,Chaos
+  SpawnIniOption=WeatherScale
+  ```
+  ```ini
+  ; WeatherExt reads this from spawn.ini (client-written), layered over rules
+  [WeatherExt]
+  WeatherScale=2.0        ; global multiplier on ALL contributor Amounts
+  StormCloudWeather.StartAmount=250
+  StormCloudWeather.Fire.Enabled=yes
+  ```
+  One dropdown, **zero** extra files, versus 500 `StartingLevel*` today.
+
+- **`WeatherScale`** — a single global multiplier applied to every contributor's
+  `Amounts` — turns the whole system's aggressiveness into one slider. This is
+  the "one cool knob" for casual lobbies.
+
+- **Per-meter lobby binding**: `WeatherSystem.LobbyKey=<name>` names a spawn.ini
+  key that enables/scales that meter, so a modder wires any meter to a
+  checkbox/dropdown without code.
+
+- **Reading from spawn.ini is correct here** despite the "spawn.ini is rewritten
+  at launch" rule: that rewrite is exactly the client writing lobby choices in,
+  so a real lobby option belongs there. (The rewrite only bites *manual test*
+  flags, which stay in rulesmd `[MultiplayerDialogSettings]`.) WeatherExt layers:
+  rulesmd `[WeatherExt]` defaults → spawn.ini `[WeatherExt]` lobby overrides.
+
+## Effects are a pluggable set — the meter is a general trigger engine
+
+To maximize diversity, every effect is gated by the **same** threshold/response
+curve primitive and hangs off the meter. Effects implemented or planned:
+`Fire.*` (SW volleys), `Versus.*` (warhead vs armor), `Cost.*`, `BuildSpeed.*`,
+`Firepower.*`, `Armor.*`, and prereq grant/deny (PrerequisiteExt producer). Any
+future effect is "one more key group reading the same curve" — and because
+"fire an SW" is an effect, zombie waves, upgrade grants, and price shocks are all
+just SWs pointed at by `Fire.Types`. The meter is a general, lobby-drivable,
+network-synced trigger engine that happens to ship a weather preset.
+
+## Hooks added by rev 2.1
+
+| Purpose | Seat | Status |
+|---|---|---|
+| Auto-fire SW (veto-composed) | call `HouseClass::Fire_SW` `0x4FAE50` (SuperWeaponExt's veto seat) — we *call*, not hook | verified: SuperWeaponExt README + YRpp signature |
+| SW-fired meter contribution | hook `SuperClass::Launch` `0x6CC390` (post-veto — only real launches) | RE-VERIFY register carrying the SuperClass + firing house |
+| Grant SW to house | `HouseClass::FindSuperWeapon` + `Supers` vector (YRpp) | verified in YRpp |
+| Warhead-vs-armor factor | per-object damage-apply seat; armor via `ArmorType_FindIndex` `0x4753F0` | RE-VERIFY exact seat (not `0x489235`, Antares-owned) |
+
+## Open questions (rev 2.1)
+
+1. **Grant policy default** — should `Fire.GrantToOwner` default yes (a meter can
+   fire any SW through any house) or no (the house must legitimately own it)?
+   Leaning **yes** for modder convenience, with the SW still subject to the veto.
+2. **Versus Tier C interpolation of `0%`** — a keyframe of `0%` (immune) linearly
+   interpolated produces fractional immunity; probably want `0%` to mean "hard
+   immune, no interp" as a special case. Flag if you'd rather it lerp.
+3. **`WeatherScale` scope** — global over all meters (one slider) vs per-meter
+   only. Leaning **both**: a global `WeatherScale` × optional per-meter scale.
