@@ -103,7 +103,22 @@ namespace
 	};
 	std::unordered_map<TechnoTypeClass*, TechnoContrib> TechnoContribMap;
 
+	// SW-fired contributor (P2b): START delta on fire, optional FINISH delta
+	// scheduled `interval` frames later.
+	struct SWContrib
+	{
+		std::vector<Contrib> start;   // .Types + .Amounts
+		std::vector<int> finish;      // .Amounts.Finish, parallel to start (empty => none)
+		int interval = 0;             // .Interval frames; <=0 => finish applied with start
+	};
+	std::unordered_map<SuperWeaponTypeClass*, SWContrib> SWContribMap;
+
+	// The synced pending-finish queue: each entry fires its delta at finishFrame.
+	struct PendingFinish { int finishFrame; int meterIdx; int amount; };
+	std::vector<PendingFinish> pendingFinish;
+
 	bool anyPassive = false;
+	bool anySWContrib = false;
 	bool finalized = false;
 
 	int logCounter = 0;
@@ -370,6 +385,14 @@ namespace
 				anyPassive = true;
 		}
 
+		anySWContrib = false;
+		for (auto& kv : SWContribMap)
+		{
+			resolve(kv.second.start, kv.first->ID);
+			if (!kv.second.start.empty())
+				anySWContrib = true;
+		}
+
 		// Resolve fire-slot SW names to SuperWeaponType indices.
 		for (auto& m : Meters)
 			for (auto& s : m.fireSlots)
@@ -463,6 +486,7 @@ void Weather::ReadGlobals(CCINIClass* pINI)
 	logCounter = 0;
 	detLinesLeft = DET_LINE_BUDGET;
 	fireLinesLeft = 40;
+	pendingFinish.clear(); // new game / re-parse: drop any scheduled pulses
 	finalized = false; // force re-resolve of contributors against the new registry
 
 	if (hadSection || c.Enabled || !Meters.empty())
@@ -532,6 +556,52 @@ void Weather::ReadTechnoType(TechnoTypeClass* pType, CCINIClass* pINI)
 	finalized = false;
 }
 
+void Weather::ReadSuperWeaponType(SuperWeaponTypeClass* pSW, CCINIClass* pINI)
+{
+	if (!pSW)
+		return;
+	std::vector<Contrib> start;
+	if (!ReadContribPair(pINI, pSW->ID, start))
+		return; // absent this pass; keep any prior parse
+	if (start.empty())
+	{
+		SWContribMap.erase(pSW);
+		finalized = false;
+		return;
+	}
+
+	SWContrib sc;
+	sc.start = std::move(start);
+
+	std::vector<int> finish;
+	ReadIntList(pINI, pSW->ID, "WeatherSystem.Amounts.Finish", finish);
+	if (!finish.empty())
+	{
+		sc.finish = std::move(finish);
+		if (sc.finish.size() != sc.start.size())
+			Debug::Log("[WeatherExt] [%s] WeatherSystem.Amounts.Finish has %zu "
+				"entries but .Types has %zu; missing finishes default to 0.\n",
+				pSW->ID, sc.finish.size(), sc.start.size());
+	}
+
+	// Interval: numeric frames. "auto" (SW's own duration) is designed but not
+	// yet wired -- treat it as 0 for now and say so.
+	if (pINI->ReadString(pSW->ID, "WeatherSystem.Interval", "", WeatherExtDLL::readBuffer, WeatherExtDLL::readLength) && *WeatherExtDLL::readBuffer)
+	{
+		if (_strcmpi(WeatherExtDLL::readBuffer, "auto") == 0)
+		{
+			Debug::Log("[WeatherExt] [%s] WeatherSystem.Interval=auto not yet "
+				"implemented; using 0 (finish applied with start).\n", pSW->ID);
+			sc.interval = 0;
+		}
+		else
+			sc.interval = std::max(0, atoi(WeatherExtDLL::readBuffer));
+	}
+
+	SWContribMap[pSW] = std::move(sc);
+	finalized = false;
+}
+
 void Weather::OnDetonation(WarheadTypeClass* pWH, TechnoClass* pSource, HouseClass* pHouse)
 {
 	if (!Config.Enabled || !pWH)
@@ -565,12 +635,89 @@ void Weather::OnDetonation(WarheadTypeClass* pWH, TechnoClass* pSource, HouseCla
 	}
 }
 
+void Weather::OnSuperWeaponFired(HouseClass* pHouse, int swSlotIndex)
+{
+	if (!Config.Enabled || !pHouse || !anySWContrib)
+		return;
+	if (!finalized)
+		Finalize();
+
+	SuperClass* pSuper = pHouse->Supers.GetItemOrDefault(swSlotIndex);
+	if (!pSuper || !pSuper->Type)
+		return;
+	// Only count a launch that is actually ready to go -- filters spurious
+	// Fire_SW calls. (This runs post-SuperWeaponExt-veto by chain order.)
+	if (!pSuper->IsReady)
+		return;
+
+	auto it = SWContribMap.find(pSuper->Type);
+	if (it == SWContribMap.end())
+		return;
+	const SWContrib& sc = it->second;
+
+	for (size_t i = 0; i < sc.start.size(); ++i)
+	{
+		const int idx = sc.start[i].idx;
+		if (idx < 0)
+			continue;
+		Meter& m = Meters[idx];
+
+		// START delta, now.
+		const int startDelta = Scaled(sc.start[i].amount);
+		if (startDelta != 0)
+			m.Amount = ClampMeter(m, m.Amount + startDelta);
+
+		// FINISH delta: scaled at SCHEDULE time (a later WeatherScale change
+		// can't retroactively desync a pending finish).
+		if (i < sc.finish.size() && sc.finish[i] != 0)
+		{
+			const int finishDelta = Scaled(sc.finish[i]);
+			if (sc.interval > 0)
+				pendingFinish.push_back({ Unsorted::CurrentFrame + sc.interval, idx, finishDelta });
+			else
+				m.Amount = ClampMeter(m, m.Amount + finishDelta); // same-frame
+		}
+	}
+
+	if (fireLinesLeft > 0)
+	{
+		--fireLinesLeft;
+		Debug::Log("[WeatherExt] frame %d: SW %s fired by %s -> contributed "
+			"(interval %d)\n", Unsorted::CurrentFrame, pSuper->Type->ID,
+			pHouse->PlainName, sc.interval);
+	}
+}
+
 void Weather::FrameTick()
 {
 	if (!Config.Enabled)
 		return;
 	if (!finalized)
 		Finalize();
+
+	// --- drain due pending-finish pulses (fixed order, integer math) ---
+	if (!pendingFinish.empty())
+	{
+		const int now = Unsorted::CurrentFrame;
+		size_t w = 0;
+		for (size_t r = 0; r < pendingFinish.size(); ++r)
+		{
+			const PendingFinish& p = pendingFinish[r];
+			if (p.finishFrame <= now)
+			{
+				if (p.meterIdx >= 0 && p.meterIdx < (int)Meters.size() && p.amount != 0)
+				{
+					Meter& m = Meters[p.meterIdx];
+					m.Amount = ClampMeter(m, m.Amount + p.amount);
+				}
+			}
+			else
+			{
+				pendingFinish[w++] = p; // keep not-yet-due entries, order preserved
+			}
+		}
+		pendingFinish.resize(w);
+	}
 
 	// --- per-meter drift toward baseline ---
 	for (auto& m : Meters)
@@ -735,6 +882,34 @@ DEFINE_HOOK(0x489286, MapClass_DamageArea_WeatherExt, 0x6)
 	GET_BASE(TechnoClass*, pSource, 0x8);
 	GET_BASE(HouseClass*, pHouse, 0x14);
 	Weather::OnDetonation(pWH, pSource, pHouse);
+	return 0;
+}
+
+// SuperWeaponTypeClass::LoadFromINI, the single SW-type parse funnel. EBP =
+// type, [esp+0x3FC] = INI. Same layout/size as the Antares+Phobos hooks at this
+// address (0xA, return 0); Antares' extra DEFINE_HOOK_AGAIN at 0x6CEE50 is
+// disjoint from this 0xA range.
+DEFINE_HOOK(0x6CEE43, SuperWeaponTypeClass_LoadFromINI_WeatherExt, 0xA)
+{
+	GET(SuperWeaponTypeClass*, pItem, EBP);
+	GET_STACK(CCINIClass*, pINI, 0x3FC);
+	Weather::ReadSuperWeaponType(pItem, pINI);
+	return 0;
+}
+
+// HouseClass::Fire_SW entry (0x4FAE50) -- the universal launch funnel and the
+// encyclopedia's designated seat for *recording* a launch. SuperWeaponExt's
+// constraint veto also sits here and is injected earlier, so it runs first: if
+// it denies (returns 0x4FAEF3, non-zero) the chain stops and we never record,
+// giving "measure low" for our own inhibitor/designator layer for free. ECX =
+// house, [esp+4] = SW slot index. Stolen 7 (push ebx; mov ebx,ecx; mov
+// ecx,[esp+8]) -- matches SuperWeaponExt's size at this address. We return 0 so
+// the launch (and Antares' downstream +0x22 checks) proceed normally.
+DEFINE_HOOK(0x4FAE50, HouseClass_Fire_SW_WeatherExt, 0x7)
+{
+	GET(HouseClass*, pHouse, ECX);
+	GET_STACK(int, idxSW, 0x4);
+	Weather::OnSuperWeaponFired(pHouse, idxSW);
 	return 0;
 }
 

@@ -5,6 +5,7 @@ class WarheadTypeClass;
 class TechnoTypeClass;
 class TechnoClass;
 class HouseClass;
+class SuperWeaponTypeClass;
 
 // P1: named meters + contributors.
 //
@@ -32,8 +33,11 @@ namespace Weather
 	void ReadGlobals(CCINIClass* pINI);       // [Weather] + [WeatherSystems] + per-meter sections
 	void ReadWarhead(WarheadTypeClass* pWH, CCINIClass* pINI);
 	void ReadTechnoType(TechnoTypeClass* pType, CCINIClass* pINI);
+	void ReadSuperWeaponType(SuperWeaponTypeClass* pSW, CCINIClass* pINI);
 
 	void OnDetonation(WarheadTypeClass* pWH, TechnoClass* pSource, HouseClass* pHouse);
+	// P2b: a superweapon fired (post-veto). swSlotIndex indexes pHouse->Supers.
+	void OnSuperWeaponFired(HouseClass* pHouse, int swSlotIndex);
 	void FrameTick();
 
 	// Read-only accessor for later effects / tests. Unknown name => 0.
