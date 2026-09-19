@@ -12,6 +12,10 @@
 // in the TU (see ScatterExt, same trap).
 #include <FootClass.h>
 #include <HouseClass.h>
+#include <SuperClass.h>
+#include <SuperWeaponTypeClass.h>
+#include <ScenarioClass.h>
+#include <MapClass.h>
 #include <Fundamentals.h>
 #include <GeneralDefinitions.h>
 
@@ -36,6 +40,25 @@ namespace
 	constexpr int MAX_METERS = 256;      // registry sanity cap
 	constexpr int DET_LINE_BUDGET = 20;  // per-game individual detonation lines
 
+	// ---- firing effect (P2) ----------------------------------------------
+	enum class TargetMode { Random, MapCenter };
+
+	// One threshold-gated firing slot: fires `swName` while the meter is at or
+	// above `threshold`, every `effectiveInterval()` frames.
+	struct FireSlot
+	{
+		std::string swName;
+		int swIndex = -1;         // resolved SuperWeaponType index (cached)
+		int threshold = 0;
+		int count = 1;
+		int baseInterval = 150;
+		int intervalStep = 0;     // added to the interval per overshoot step
+		int intervalStepAmount = 1;
+		int intervalMin = 1;      // floor -- a negative step must never reach <=0
+		int timer = 0;            // runtime: frames until next volley
+		int fired = 0;            // runtime: volleys fired (for log budget)
+	};
+
 	// ---- meters -----------------------------------------------------------
 	struct Meter
 	{
@@ -48,6 +71,12 @@ namespace
 		int DecayRate = 15;   // frames between drift ticks (>=1)
 		int Amount = 0;
 		int decayCounter = 0;
+
+		// firing effect
+		std::vector<FireSlot> fireSlots;
+		TargetMode target = TargetMode::Random;
+		std::string owner = "neutral"; // neutral | random | <country>
+		bool grantToOwner = true;
 	};
 
 	std::vector<Meter> Meters;
@@ -157,6 +186,70 @@ namespace
 		return true;
 	}
 
+	// Parse the Fire.* block for one meter. Present-only: absent Fire.Types
+	// keeps whatever an earlier pass parsed.
+	void ReadFireSlots(CCINIClass* pINI, Meter& m)
+	{
+		std::vector<std::string> types;
+		ReadNameList(pINI, m.Name.c_str(), "Fire.Types", types);
+		if (types.empty())
+		{
+			// still let target/owner/grant be tuned on a later pass
+			if (!m.fireSlots.empty())
+			{
+				if (pINI->ReadString(m.Name.c_str(), "Fire.Owner", "", WeatherExtDLL::readBuffer, WeatherExtDLL::readLength) && *WeatherExtDLL::readBuffer)
+					m.owner = WeatherExtDLL::readBuffer;
+				m.grantToOwner = ReadBoolKeepCurrent(pINI, m.Name.c_str(), "Fire.GrantToOwner", m.grantToOwner);
+			}
+			return;
+		}
+
+		std::vector<int> amounts, counts, intervals, steps, stepAmounts, mins;
+		ReadIntList(pINI, m.Name.c_str(), "Fire.Amounts", amounts);
+		ReadIntList(pINI, m.Name.c_str(), "Fire.Counts", counts);
+		ReadIntList(pINI, m.Name.c_str(), "Fire.Intervals", intervals);
+		ReadIntList(pINI, m.Name.c_str(), "Fire.IntervalStep", steps);
+		ReadIntList(pINI, m.Name.c_str(), "Fire.IntervalStepAmount", stepAmounts);
+		ReadIntList(pINI, m.Name.c_str(), "Fire.IntervalMin", mins);
+
+		auto at = [](const std::vector<int>& v, size_t i, int def) {
+			return i < v.size() ? v[i] : def;
+		};
+
+		m.fireSlots.clear();
+		for (size_t i = 0; i < types.size(); ++i)
+		{
+			FireSlot s;
+			s.swName = types[i];
+			s.threshold = at(amounts, i, 0);
+			s.count = std::max(1, at(counts, i, 1));
+			s.baseInterval = std::max(1, at(intervals, i, 150));
+			s.intervalStep = at(steps, i, 0);
+			s.intervalStepAmount = std::max(1, at(stepAmounts, i, 1));
+			// Mandatory floor: without it a negative step drives the interval to
+			// <= 0 (fire every frame). Default to the base interval so an
+			// unspecified min never accelerates below the author's stated rate.
+			s.intervalMin = std::max(1, at(mins, i, s.baseInterval));
+			m.fireSlots.push_back(std::move(s));
+		}
+
+		// target mode
+		m.target = TargetMode::Random;
+		if (pINI->ReadString(m.Name.c_str(), "Fire.Target", "", WeatherExtDLL::readBuffer, WeatherExtDLL::readLength) && *WeatherExtDLL::readBuffer)
+		{
+			if (_strcmpi(WeatherExtDLL::readBuffer, "mapcenter") == 0)
+				m.target = TargetMode::MapCenter;
+			else if (_strcmpi(WeatherExtDLL::readBuffer, "random") != 0)
+				Debug::Log("[WeatherExt] [%s] Fire.Target=%s unrecognised "
+					"(expected random|mapcenter); using random.\n",
+					m.Name.c_str(), WeatherExtDLL::readBuffer);
+		}
+
+		if (pINI->ReadString(m.Name.c_str(), "Fire.Owner", "", WeatherExtDLL::readBuffer, WeatherExtDLL::readLength) && *WeatherExtDLL::readBuffer)
+			m.owner = WeatherExtDLL::readBuffer;
+		m.grantToOwner = ReadBoolKeepCurrent(pINI, m.Name.c_str(), "Fire.GrantToOwner", true);
+	}
+
 	Meter* FindMeter(const char* name)
 	{
 		auto it = MeterIndex.find(name);
@@ -171,6 +264,79 @@ namespace
 	int Scaled(int amount)
 	{
 		return static_cast<int>(std::lround(amount * Weather::Config.WeatherScale));
+	}
+
+	// ---- firing (P2) ------------------------------------------------------
+	int fireLinesLeft = 40; // per-game individual fire-line budget
+
+	HouseClass* ResolveFiringHouse(const std::string& owner)
+	{
+		if (owner.empty() || _strcmpi(owner.c_str(), "neutral") == 0)
+		{
+			if (auto pH = HouseClass::FindNeutral()) return pH;
+			if (auto pH = HouseClass::FindSpecial()) return pH;
+			return HouseClass::Array.Count ? HouseClass::Array.Items[0] : nullptr;
+		}
+		if (_strcmpi(owner.c_str(), "random") == 0)
+		{
+			// synced pick among houses still in play; iterate in index order.
+			int candidates = 0;
+			for (int i = 0; i < HouseClass::Array.Count; ++i)
+			{
+				auto pH = HouseClass::Array.Items[i];
+				if (pH && !pH->Defeated && !pH->IsNeutral())
+					++candidates;
+			}
+			if (candidates == 0)
+				return HouseClass::FindNeutral();
+			int pick = ScenarioClass::Instance->Random.RandomRanged(0, candidates - 1);
+			for (int i = 0; i < HouseClass::Array.Count; ++i)
+			{
+				auto pH = HouseClass::Array.Items[i];
+				if (pH && !pH->Defeated && !pH->IsNeutral() && pick-- == 0)
+					return pH;
+			}
+			return HouseClass::FindNeutral();
+		}
+		return HouseClass::FindByCountryName(owner.c_str());
+	}
+
+	CellStruct PickTargetCell(TargetMode mode)
+	{
+		const auto& b = MapClass::Instance.MapCoordBounds;
+		CellStruct cell{};
+		if (mode == TargetMode::MapCenter)
+		{
+			cell.X = static_cast<short>((b.Left + b.Right) / 2);
+			cell.Y = static_cast<short>((b.Top + b.Bottom) / 2);
+		}
+		else // Random -- synced RNG so every client picks the same cell
+		{
+			auto& rng = ScenarioClass::Instance->Random;
+			cell.X = static_cast<short>(rng.RandomRanged(b.Left, b.Right));
+			cell.Y = static_cast<short>(rng.RandomRanged(b.Top, b.Bottom));
+		}
+		return cell;
+	}
+
+	// Fire one SW of `swIndex` from `pHouse` at `cell`, through Fire_SW
+	// (0x4FAE50) so Antares' AND SuperWeaponExt's inhibitor/designator vetoes
+	// both apply. Returns false if the house can't field the SW.
+	bool FireOneSW(HouseClass* pHouse, int swIndex, bool grant, const CellStruct& cell)
+	{
+		if (!pHouse || swIndex < 0)
+			return false;
+		int idx = pHouse->FindSuperWeaponIndex(static_cast<SuperWeaponType>(swIndex));
+		if (idx < 0)
+			return false;
+		SuperClass* pSuper = pHouse->Supers.GetItem(idx);
+		if (!pSuper)
+			return false;
+		if (grant)
+			pSuper->Grant(false, false, false); // permanent, silent, not on-hold
+		pSuper->SetReadiness(true);             // WeatherExt owns cadence
+		pHouse->Fire_SW(idx, cell);             // veto layers decide from here
+		return true;
 	}
 
 	// Resolve every contributor's meter name to an index, once. Unknown names
@@ -203,6 +369,17 @@ namespace
 			if (kv.second.rate > 0 && !kv.second.list.empty())
 				anyPassive = true;
 		}
+
+		// Resolve fire-slot SW names to SuperWeaponType indices.
+		for (auto& m : Meters)
+			for (auto& s : m.fireSlots)
+			{
+				s.swIndex = SuperWeaponTypeClass::FindIndex(s.swName.c_str());
+				if (s.swIndex < 0)
+					Debug::Log("[WeatherExt] meter '%s' Fire.Types names unknown "
+						"superweapon '%s'; that slot is disabled.\n",
+						m.Name.c_str(), s.swName.c_str());
+			}
 
 		finalized = true;
 	}
@@ -275,6 +452,8 @@ void Weather::ReadGlobals(CCINIClass* pINI)
 			Debug::Log("[WeatherExt] [%s] Max=%d < Min=%d; swapping.\n", s, m.Max, m.Min);
 			std::swap(m.Min, m.Max);
 		}
+		ReadFireSlots(pINI, m);
+
 		// Every pass runs before gameplay, so seeding the start here means the
 		// game begins at StartAmount (clamped) for the last pass that ran.
 		m.Amount = ClampMeter(m, m.StartAmount);
@@ -283,6 +462,7 @@ void Weather::ReadGlobals(CCINIClass* pINI)
 
 	logCounter = 0;
 	detLinesLeft = DET_LINE_BUDGET;
+	fireLinesLeft = 40;
 	finalized = false; // force re-resolve of contributors against the new registry
 
 	if (hadSection || c.Enabled || !Meters.empty())
@@ -292,8 +472,9 @@ void Weather::ReadGlobals(CCINIClass* pINI)
 			Meters.size());
 		for (auto& m : Meters)
 			Debug::Log("[WeatherExt]   meter '%s': start=%d range=[%d,%d] "
-				"baseline=%d decay=%d/%df\n", m.Name.c_str(), m.StartAmount,
-				m.Min, m.Max, m.Baseline, m.Decay, m.DecayRate);
+				"baseline=%d decay=%d/%df fireSlots=%zu owner=%s\n",
+				m.Name.c_str(), m.StartAmount, m.Min, m.Max, m.Baseline,
+				m.Decay, m.DecayRate, m.fireSlots.size(), m.owner.c_str());
 	}
 }
 
@@ -439,6 +620,54 @@ void Weather::FrameTick()
 				const int delta = Scaled(c.amount);
 				if (delta != 0)
 					m.Amount = ClampMeter(m, m.Amount + delta);
+			}
+		}
+	}
+
+	// --- Effect 1: threshold-gated superweapon firing ---
+	// Deterministic: meters in registry order, slots in list order, timers
+	// driven by synced Amount, targets/owners drawn from ScenarioClass::Random.
+	for (auto& m : Meters)
+	{
+		for (auto& s : m.fireSlots)
+		{
+			if (s.swIndex < 0)
+				continue;
+			if (m.Amount < s.threshold)
+			{
+				s.timer = 0; // re-arm: fires immediately when it next crosses
+				continue;
+			}
+			if (s.timer > 0)
+			{
+				--s.timer;
+				continue;
+			}
+
+			// effective interval shrinks (or grows) with overshoot, floored.
+			const int over = m.Amount - s.threshold;
+			const int steps = over / s.intervalStepAmount;
+			int interval = s.baseInterval + s.intervalStep * steps;
+			interval = std::max(interval, s.intervalMin);
+
+			HouseClass* pHouse = ResolveFiringHouse(m.owner);
+			int launched = 0;
+			for (int k = 0; k < s.count; ++k)
+			{
+				const CellStruct cell = PickTargetCell(m.target);
+				if (FireOneSW(pHouse, s.swIndex, m.grantToOwner, cell))
+					++launched;
+			}
+			s.timer = interval;
+			++s.fired;
+
+			if (fireLinesLeft > 0)
+			{
+				--fireLinesLeft;
+				Debug::Log("[WeatherExt] frame %d: '%s'=%d fired %s x%d "
+					"(owner %s, next in %df)\n", Unsorted::CurrentFrame,
+					m.Name.c_str(), m.Amount, s.swName.c_str(), launched,
+					pHouse ? pHouse->PlainName : "<none>", interval);
 			}
 		}
 	}
