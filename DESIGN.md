@@ -679,3 +679,34 @@ SW pulse plus whatever effect the threshold triggers.
    during the window, should finish still subtract the full scheduled amount
    (can overshoot below where it started) or only what was actually added?
    Leaning **full scheduled amount** (simple, predictable, symmetric).
+
+---
+
+# Performance notes (from P2 in-game testing)
+
+In-game testing surfaced heavy lag once storms started firing. Root cause was a
+**test-config runaway**, not a WeatherExt cost: a contributor (`+5/15f`) exceeded
+the meter's `Decay` (`1/15f`), so the meter climbed unbounded to ~57,000, where
+`Fire.IntervalMin` pinned it at a storm every 45 frames — dozens of overlapping
+global `LightningStorm` effects. LightningStorm's bolt rendering is the known YR
+CPU-render bottleneck, so stacking them tanks the framerate. WeatherExt's own
+per-frame tick (the array walk + meter math) is negligible by comparison.
+
+Guidance baked into the design so this is avoidable by construction:
+
+- **Bound every meter.** Set `Max` and a `Decay` that can actually overcome the
+  contributors, or the meter pins at `Max` and fires at `IntervalMin` forever.
+  A meter fed faster than it decays is a runaway by definition.
+- **`Fire.IntervalMin` is the real throttle.** It caps *how often* an effect can
+  fire regardless of meter height. For an expensive SW (anything global, like
+  LightningStorm) keep it generous — a storm every few seconds is already a lot.
+- **Cost scales with the SW, not with WeatherExt.** Firing a cheap localized SW
+  often is fine; firing a whole-map effect often is not. The lag is
+  `fire_rate × that SW's own effect cost`.
+- **Prefer one strong storm over many stacked ones.** Overlapping global effects
+  multiply render load; a single longer/stronger effect reads similarly and costs
+  far less.
+
+Possible future lever (not built): an optional "don't re-fire while this SW's
+effect is still active" guard, to make stacking impossible for global effects
+without hand-tuning `IntervalMin`.
