@@ -710,3 +710,39 @@ Guidance baked into the design so this is avoidable by construction:
 Possible future lever (not built): an optional "don't re-fire while this SW's
 effect is still active" guard, to make stacking impossible for global effects
 without hand-tuning `IntervalMin`.
+
+---
+
+# Design rev 3 — Versus rows by armor NAME (P3, implemented)
+
+P3 shipped Versus rows as positional (Verses order). Follow-up: they can now be
+authored **by armor name**, while staying a positional row behind the scenes.
+
+```ini
+[StormCloudWeather]
+Versus.Warheads=Lightning
+
+; Tier A -- uniform scalar curve (unchanged)
+Versus.Lightning.PerAmount=1000
+Versus.Lightning.Mult=0.5
+Versus.Lightning.MultMax=8.0
+
+; Tier C by NAME -- list only the armors you care about; the rest stay x1
+Versus.Lightning.Keyframes=0,12500,25000
+Versus.Lightning.Armors=wood,concrete,special_1
+Versus.Lightning.Row.0=1,1,1
+Versus.Lightning.Row.12500=6,4,10
+Versus.Lightning.Row.25000=12,8,20
+Versus.Lightning.Interp=linear
+```
+
+How the names resolve: WeatherExt builds an armor name→index map that mirrors the
+engine's own order — the 11 built-ins (`none, flak, plate, light, medium, heavy,
+wood, steel, concrete, special_1, special_2` = 0..10) hardcoded, then every
+`[ArmorTypes]` key enumerated in file order (the same order Antares'
+FindOrAllocate assigns). So a name like `special_1` or a custom `steelBunker`
+maps to exactly the column the game uses. Each `Row.<kf>` is parallel to the
+`Armors=` list (sparse — any armor you don't name keeps its ×1), and internally
+it's expanded to the full positional row the damage hook indexes. Unknown names
+log a warning and skip that column. Omit `Armors=` and a `Row` is still a full
+positional row (Verses order), so old configs are unaffected.
