@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>   // atoi, _itoa_s
 #include <cstring>   // strtok_s, strlen
+#include <cctype>    // tolower
 #include <cmath>
 
 Weather::DllConfig Weather::Config;
@@ -104,6 +105,46 @@ namespace
 
 	std::vector<Meter> Meters;
 	std::unordered_map<std::string, int> MeterIndex; // name -> Meters[] index
+
+	// Armor name -> Verses column index, mirroring the engine's order: the 11
+	// built-ins (0-10) then [ArmorTypes] keys in file order. Lets the modder
+	// write Versus rows by armor NAME; we resolve to the positional row the
+	// damage hook actually indexes. Names are stored lower-cased (engine armor
+	// lookups are case-insensitive). Accumulated across INI passes, never wiped.
+	std::unordered_map<std::string, int> ArmorNameIndex;
+
+	std::string Lower(const char* s)
+	{
+		std::string r(s ? s : "");
+		for (auto& ch : r) ch = (char)tolower((unsigned char)ch);
+		return r;
+	}
+
+	void BuildArmorNames(CCINIClass* pINI)
+	{
+		if (ArmorNameIndex.empty())
+		{
+			const char* base[] = { "none","flak","plate","light","medium","heavy",
+				"wood","steel","concrete","special_1","special_2" };
+			for (int i = 0; i < 11; ++i)
+				ArmorNameIndex[base[i]] = i;
+		}
+		// Append custom [ArmorTypes] keys in file order (FindOrAllocate-style:
+		// a key already known keeps its index).
+		const int n = pINI->GetKeyCount("ArmorTypes");
+		for (int i = 0; i < n; ++i)
+		{
+			const char* key = pINI->GetKeyName("ArmorTypes", i);
+			if (!key || !*key)
+				continue;
+			std::string k = Lower(key);
+			if (ArmorNameIndex.find(k) == ArmorNameIndex.end())
+			{
+				const int next = (int)ArmorNameIndex.size(); // read before insert
+				ArmorNameIndex[k] = next;
+			}
+		}
+	}
 
 	// ---- contributors (stored by NAME, resolved lazily) -------------------
 	// Name-based storage makes parse ORDER irrelevant: a contributor can name a
@@ -336,15 +377,53 @@ namespace
 			_snprintf_s(key, sizeof(key), "Versus.%s.MultMax", wh.c_str());
 			c.multMaxA = pINI->ReadDouble(m.Name.c_str(), key, 1e9);
 
-			// Tier C keyframes + rows
+			// Tier C keyframes + rows. Rows may be authored BY NAME: if
+			// Versus.<WH>.Armors= lists armor names, each Row.<kf> is parallel
+			// to that list (sparse -- unlisted armors stay at x1). Without
+			// Armors=, a Row is a full positional row in Verses order.
 			_snprintf_s(key, sizeof(key), "Versus.%s.Keyframes", wh.c_str());
 			ReadIntList(pINI, m.Name.c_str(), key, c.keyframes);
+
+			std::vector<int> cols; // armor index per row column; empty => positional
+			_snprintf_s(key, sizeof(key), "Versus.%s.Armors", wh.c_str());
+			std::vector<std::string> armorNames;
+			ReadNameList(pINI, m.Name.c_str(), key, armorNames);
+			for (auto& an : armorNames)
+			{
+				auto ai = ArmorNameIndex.find(Lower(an.c_str()));
+				if (ai == ArmorNameIndex.end())
+				{
+					Debug::Log("[WeatherExt] [%s] Versus.%s.Armors: unknown armor "
+						"'%s'; that column is ignored.\n", m.Name.c_str(), wh.c_str(), an.c_str());
+					cols.push_back(-1);
+				}
+				else
+					cols.push_back(ai->second);
+			}
+
 			for (int kf : c.keyframes)
 			{
 				_snprintf_s(key, sizeof(key), "Versus.%s.Row.%d", wh.c_str(), kf);
-				std::vector<double> row;
-				ReadDoubleList(pINI, m.Name.c_str(), key, row);
-				c.rows.push_back(std::move(row));
+				std::vector<double> raw;
+				ReadDoubleList(pINI, m.Name.c_str(), key, raw);
+
+				if (cols.empty())
+				{
+					// positional: the row IS the full armor-indexed row
+					c.rows.push_back(std::move(raw));
+				}
+				else
+				{
+					// by-name: scatter raw[j] into a positional row at cols[j],
+					// defaulting every other armor to x1.
+					int maxIdx = 10; // always cover the 11 built-ins
+					for (int ci : cols) if (ci > maxIdx) maxIdx = ci;
+					std::vector<double> row(maxIdx + 1, 1.0);
+					for (size_t j = 0; j < cols.size() && j < raw.size(); ++j)
+						if (cols[j] >= 0)
+							row[cols[j]] = raw[j];
+					c.rows.push_back(std::move(row));
+				}
 			}
 			_snprintf_s(key, sizeof(key), "Versus.%s.Interp", wh.c_str());
 			if (pINI->ReadString(m.Name.c_str(), key, "", WeatherExtDLL::readBuffer, WeatherExtDLL::readLength)
@@ -568,6 +647,9 @@ void Weather::ReadGlobals(CCINIClass* pINI)
 {
 	auto& c = Config;
 	const bool hadSection = pINI->GetSection(CFG_SECTION) != nullptr;
+
+	// Build the armor-name -> index map first so Versus rows can resolve names.
+	BuildArmorNames(pINI);
 
 	c.Enabled = ReadBoolKeepCurrent(pINI, CFG_SECTION, "Enabled", c.Enabled);
 	c.LogInterval = pINI->ReadInteger(CFG_SECTION, "LogInterval", c.LogInterval);
