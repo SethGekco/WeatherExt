@@ -420,6 +420,7 @@ namespace
 
 	// ---- firing (P2) ------------------------------------------------------
 	int fireLinesLeft = 40; // per-game individual fire-line budget
+	int versusLinesLeft = 20; // per-game damage-adjust log budget
 
 	HouseClass* ResolveFiringHouse(const std::string& owner)
 	{
@@ -642,6 +643,7 @@ void Weather::ReadGlobals(CCINIClass* pINI)
 	logCounter = 0;
 	detLinesLeft = DET_LINE_BUDGET;
 	fireLinesLeft = 40;
+	versusLinesLeft = 20;
 	pendingFinish.clear(); // new game / re-parse: drop any scheduled pulses
 	finalized = false; // force re-resolve of contributors against the new registry
 
@@ -861,7 +863,14 @@ int Weather::AdjustDamage(int damage, WarheadTypeClass* pWH, int armor)
 
 	if (factor == 1.0)
 		return damage;
-	return static_cast<int>(std::lround(damage * factor));
+	const int adjusted = static_cast<int>(std::lround(damage * factor));
+	if (versusLinesLeft > 0)
+	{
+		--versusLinesLeft;
+		Debug::Log("[WeatherExt] frame %d: %s vs armor %d damage %d -> %d (x%.2f)\n",
+			Unsorted::CurrentFrame, pWH->ID, armor, damage, adjusted, factor);
+	}
+	return adjusted;
 }
 
 void Weather::FrameTick()
