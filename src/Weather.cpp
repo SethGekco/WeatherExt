@@ -59,6 +59,26 @@ namespace
 		int fired = 0;            // runtime: volleys fired (for log budget)
 	};
 
+	// ---- warhead-vs-armor effect (P3) ------------------------------------
+	// A weather-driven MULTIPLIER on a warhead's damage, keyed by the meter
+	// amount and (optionally) the victim's armor. Applied at GetTotalDamage,
+	// so it multiplies on TOP of the warhead's base Verses row.
+	struct VersusCurve
+	{
+		std::string whName;
+		WarheadTypeClass* wh = nullptr; // resolved in Finalize
+
+		// Tier A: one uniform scalar for the whole warhead.
+		int perAmountA = 0;          // 0 => Tier A off
+		double multA = 0.0;          // factor += multA per step
+		double multMaxA = 1e9;
+
+		// Tier C: keyframed per-armor multiplier rows (positional, Verses order).
+		std::vector<int> keyframes;              // ascending meter amounts
+		std::vector<std::vector<double>> rows;   // rows[k][armorIndex] multiplier
+		bool interpStep = false;                 // false = linear, true = hold
+	};
+
 	// ---- meters -----------------------------------------------------------
 	struct Meter
 	{
@@ -77,6 +97,9 @@ namespace
 		TargetMode target = TargetMode::Random;
 		std::string owner = "neutral"; // neutral | random | <country>
 		bool grantToOwner = true;
+
+		// warhead-vs-armor effect
+		std::vector<VersusCurve> versus;
 	};
 
 	std::vector<Meter> Meters;
@@ -117,8 +140,14 @@ namespace
 	struct PendingFinish { int finishFrame; int meterIdx; int amount; };
 	std::vector<PendingFinish> pendingFinish;
 
+	// Fast per-warhead lookup for the damage hook, built in Finalize. Points
+	// into Meters[].versus (stable between Finalize and the next re-parse).
+	struct ResolvedVersus { int meterIdx; const VersusCurve* curve; };
+	std::unordered_map<WarheadTypeClass*, std::vector<ResolvedVersus>> WarheadVersusMap;
+
 	bool anyPassive = false;
 	bool anySWContrib = false;
+	bool anyVersus = false;
 	bool finalized = false;
 
 	int logCounter = 0;
@@ -171,6 +200,24 @@ namespace
 		char* ctx = nullptr;
 		for (char* tok = strtok_s(WeatherExtDLL::readBuffer, ",", &ctx); tok; tok = strtok_s(nullptr, ",", &ctx))
 			out.push_back(atoi(tok));
+	}
+
+	// Double list; a trailing '%' means "divide by 100" so both 2.0 and 200%
+	// read as x2 multipliers.
+	void ReadDoubleList(CCINIClass* pINI, const char* section, const char* key,
+		std::vector<double>& out)
+	{
+		out.clear();
+		if (!pINI->ReadString(section, key, "", WeatherExtDLL::readBuffer, WeatherExtDLL::readLength))
+			return;
+		char* ctx = nullptr;
+		for (char* tok = strtok_s(WeatherExtDLL::readBuffer, ",", &ctx); tok; tok = strtok_s(nullptr, ",", &ctx))
+		{
+			double v = atof(tok);
+			if (strchr(tok, '%'))
+				v /= 100.0;
+			out.push_back(v);
+		}
 	}
 
 	// Build the [warhead/type] contributor list from the parallel .Types /
@@ -263,6 +310,96 @@ namespace
 		if (pINI->ReadString(m.Name.c_str(), "Fire.Owner", "", WeatherExtDLL::readBuffer, WeatherExtDLL::readLength) && *WeatherExtDLL::readBuffer)
 			m.owner = WeatherExtDLL::readBuffer;
 		m.grantToOwner = ReadBoolKeepCurrent(pINI, m.Name.c_str(), "Fire.GrantToOwner", true);
+	}
+
+	// Parse the Versus.* block for one meter. Present-only: absent
+	// Versus.Warheads keeps whatever an earlier pass parsed.
+	void ReadMeterVersus(CCINIClass* pINI, Meter& m)
+	{
+		std::vector<std::string> whs;
+		ReadNameList(pINI, m.Name.c_str(), "Versus.Warheads", whs);
+		if (whs.empty())
+			return;
+
+		m.versus.clear();
+		char key[128];
+		for (auto& wh : whs)
+		{
+			VersusCurve c;
+			c.whName = wh;
+
+			// Tier A
+			_snprintf_s(key, sizeof(key), "Versus.%s.PerAmount", wh.c_str());
+			c.perAmountA = pINI->ReadInteger(m.Name.c_str(), key, 0);
+			_snprintf_s(key, sizeof(key), "Versus.%s.Mult", wh.c_str());
+			c.multA = pINI->ReadDouble(m.Name.c_str(), key, 0.0);
+			_snprintf_s(key, sizeof(key), "Versus.%s.MultMax", wh.c_str());
+			c.multMaxA = pINI->ReadDouble(m.Name.c_str(), key, 1e9);
+
+			// Tier C keyframes + rows
+			_snprintf_s(key, sizeof(key), "Versus.%s.Keyframes", wh.c_str());
+			ReadIntList(pINI, m.Name.c_str(), key, c.keyframes);
+			for (int kf : c.keyframes)
+			{
+				_snprintf_s(key, sizeof(key), "Versus.%s.Row.%d", wh.c_str(), kf);
+				std::vector<double> row;
+				ReadDoubleList(pINI, m.Name.c_str(), key, row);
+				c.rows.push_back(std::move(row));
+			}
+			_snprintf_s(key, sizeof(key), "Versus.%s.Interp", wh.c_str());
+			if (pINI->ReadString(m.Name.c_str(), key, "", WeatherExtDLL::readBuffer, WeatherExtDLL::readLength)
+				&& _strcmpi(WeatherExtDLL::readBuffer, "step") == 0)
+				c.interpStep = true;
+
+			m.versus.push_back(std::move(c));
+		}
+	}
+
+	// Evaluate a curve's damage multiplier at the given meter amount + armor.
+	double EvalVersus(const VersusCurve& c, int amount, int armor)
+	{
+		double factor = 1.0;
+
+		// Tier A: uniform scalar.
+		if (c.perAmountA > 0 && amount > 0)
+		{
+			const int steps = amount / c.perAmountA;
+			double fA = 1.0 + c.multA * steps;
+			if (fA > c.multMaxA) fA = c.multMaxA;
+			if (fA < 0.0) fA = 0.0;
+			factor *= fA;
+		}
+
+		// Tier C: interpolate the per-armor multiplier row at `amount`.
+		if (!c.keyframes.empty())
+		{
+			auto rowVal = [&](size_t k) -> double {
+				const auto& row = c.rows[k];
+				return (armor >= 0 && armor < (int)row.size()) ? row[armor] : 1.0;
+			};
+			double fC;
+			if (amount <= c.keyframes.front())
+				fC = rowVal(0);
+			else if (amount >= c.keyframes.back())
+				fC = rowVal(c.keyframes.size() - 1);
+			else
+			{
+				size_t k = 0;
+				while (k + 1 < c.keyframes.size() && c.keyframes[k + 1] <= amount)
+					++k;
+				if (c.interpStep)
+					fC = rowVal(k);
+				else
+				{
+					const int lo = c.keyframes[k], hi = c.keyframes[k + 1];
+					const double t = hi > lo ? double(amount - lo) / double(hi - lo) : 0.0;
+					fC = rowVal(k) + (rowVal(k + 1) - rowVal(k)) * t;
+				}
+			}
+			factor *= fC;
+		}
+
+		return factor;
 	}
 
 	Meter* FindMeter(const char* name)
@@ -404,6 +541,24 @@ namespace
 						m.Name.c_str(), s.swName.c_str());
 			}
 
+		// Build the per-warhead versus lookup (resolve warhead names).
+		WarheadVersusMap.clear();
+		anyVersus = false;
+		for (int mi = 0; mi < (int)Meters.size(); ++mi)
+			for (auto& c : Meters[mi].versus)
+			{
+				c.wh = WarheadTypeClass::Find(c.whName.c_str());
+				if (!c.wh)
+				{
+					Debug::Log("[WeatherExt] meter '%s' Versus.Warheads names "
+						"unknown warhead '%s'; ignored.\n",
+						Meters[mi].Name.c_str(), c.whName.c_str());
+					continue;
+				}
+				WarheadVersusMap[c.wh].push_back({ mi, &c });
+				anyVersus = true;
+			}
+
 		finalized = true;
 	}
 }
@@ -476,6 +631,7 @@ void Weather::ReadGlobals(CCINIClass* pINI)
 			std::swap(m.Min, m.Max);
 		}
 		ReadFireSlots(pINI, m);
+		ReadMeterVersus(pINI, m);
 
 		// Every pass runs before gameplay, so seeding the start here means the
 		// game begins at StartAmount (clamped) for the last pass that ran.
@@ -686,6 +842,26 @@ void Weather::OnSuperWeaponFired(HouseClass* pHouse, int swSlotIndex)
 			"(interval %d)\n", Unsorted::CurrentFrame, pSuper->Type->ID,
 			pHouse->PlainName, sc.interval);
 	}
+}
+
+int Weather::AdjustDamage(int damage, WarheadTypeClass* pWH, int armor)
+{
+	if (!Config.Enabled || !anyVersus || !pWH || damage == 0)
+		return damage;
+	if (!finalized)
+		Finalize();
+
+	auto it = WarheadVersusMap.find(pWH);
+	if (it == WarheadVersusMap.end())
+		return damage;
+
+	double factor = 1.0;
+	for (const auto& rv : it->second)
+		factor *= EvalVersus(*rv.curve, Meters[rv.meterIdx].Amount, armor);
+
+	if (factor == 1.0)
+		return damage;
+	return static_cast<int>(std::lround(damage * factor));
 }
 
 void Weather::FrameTick()
@@ -910,6 +1086,25 @@ DEFINE_HOOK(0x4FAE50, HouseClass_Fire_SW_WeatherExt, 0x7)
 	GET(HouseClass*, pHouse, ECX);
 	GET_STACK(int, idxSW, 0x4);
 	Weather::OnSuperWeaponFired(pHouse, idxSW);
+	return 0;
+}
+
+// MapClass::GetTotalDamage entry (0x489180) -- the universal damage-vs-armor
+// funnel: __fastcall(int damage ECX, WarheadTypeClass* EDX, Armor [esp+4],
+// int distance [esp+8]). Unhooked by frameworks at the entry (Phobos starts at
+// +0x2F, Antares' Verses multiply at +0xB5), so we scale the INPUT damage and
+// let Antares apply base Verses downstream -- our factor multiplies on top.
+// Stolen 6 (sub esp,0xc; push esi; mov esi,ecx); the stub's `mov esi,ecx`
+// re-reads our modified ECX. Hot path: AdjustDamage fast-returns unless a
+// versus curve is configured for this warhead.
+DEFINE_HOOK(0x489180, MapClass_GetTotalDamage_WeatherExt, 0x6)
+{
+	GET(int, damage, ECX);
+	GET(WarheadTypeClass*, pWH, EDX);
+	GET_STACK(int, armor, 0x4);
+	const int adjusted = Weather::AdjustDamage(damage, pWH, armor);
+	if (adjusted != damage)
+		R->ECX(adjusted);
 	return 0;
 }
 

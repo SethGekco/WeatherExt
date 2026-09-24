@@ -38,6 +38,9 @@ namespace Weather
 	void OnDetonation(WarheadTypeClass* pWH, TechnoClass* pSource, HouseClass* pHouse);
 	// P2b: a superweapon fired (post-veto). swSlotIndex indexes pHouse->Supers.
 	void OnSuperWeaponFired(HouseClass* pHouse, int swSlotIndex);
+	// P3: weather-driven damage multiplier at GetTotalDamage. Returns the
+	// adjusted damage (unchanged when no curve applies).
+	int AdjustDamage(int damage, WarheadTypeClass* pWH, int armor);
 	void FrameTick();
 
 	// Read-only accessor for later effects / tests. Unknown name => 0.
