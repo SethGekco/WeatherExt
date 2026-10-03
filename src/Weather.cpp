@@ -80,6 +80,25 @@ namespace
 		bool interpStep = false;                 // false = linear, true = hold
 	};
 
+	// A simple linear response curve: factor = clamp(1 + mult*(amount/perAmount),
+	// 0, multMax). perAmount <= 0 disables it (factor stays 1).
+	struct ScalarCurve
+	{
+		int perAmount = 0;
+		double mult = 0.0;
+		double multMax = 1e9;
+	};
+
+	double EvalScalar(const ScalarCurve& c, int amount)
+	{
+		if (c.perAmount <= 0 || amount <= 0)
+			return 1.0;
+		double f = 1.0 + c.mult * (double(amount) / c.perAmount);
+		if (f > c.multMax) f = c.multMax;
+		if (f < 0.0) f = 0.0;
+		return f;
+	}
+
 	// ---- meters -----------------------------------------------------------
 	struct Meter
 	{
@@ -101,6 +120,13 @@ namespace
 
 		// warhead-vs-armor effect
 		std::vector<VersusCurve> versus;
+
+		// global combat multipliers (P4): applied to ALL damage at the
+		// GetTotalDamage seat. Firepower multiplies damage up; Armor divides it
+		// (tankier world). Net global factor = firepower / armor.
+		ScalarCurve firepower;
+		ScalarCurve armor;
+		bool hasGlobalDamage = false;
 	};
 
 	std::vector<Meter> Meters;
@@ -189,6 +215,7 @@ namespace
 	bool anyPassive = false;
 	bool anySWContrib = false;
 	bool anyVersus = false;
+	bool anyGlobalDamage = false;
 	bool finalized = false;
 
 	int logCounter = 0;
@@ -434,6 +461,20 @@ namespace
 		}
 	}
 
+	// Parse the global combat multipliers for one meter.
+	void ReadMeterModifiers(CCINIClass* pINI, Meter& m)
+	{
+		const char* s = m.Name.c_str();
+		m.firepower.perAmount = pINI->ReadInteger(s, "Firepower.PerAmount", m.firepower.perAmount);
+		m.firepower.mult = pINI->ReadDouble(s, "Firepower.Mult", m.firepower.mult);
+		m.firepower.multMax = pINI->ReadDouble(s, "Firepower.MultMax", m.firepower.multMax);
+		m.armor.perAmount = pINI->ReadInteger(s, "Armor.PerAmount", m.armor.perAmount);
+		m.armor.mult = pINI->ReadDouble(s, "Armor.Mult", m.armor.mult);
+		m.armor.multMax = pINI->ReadDouble(s, "Armor.MultMax", m.armor.multMax);
+		m.hasGlobalDamage = (m.firepower.perAmount > 0 && m.firepower.mult != 0.0)
+			|| (m.armor.perAmount > 0 && m.armor.mult != 0.0);
+	}
+
 	// Evaluate a curve's damage multiplier at the given meter amount + armor.
 	double EvalVersus(const VersusCurve& c, int amount, int armor)
 	{
@@ -621,6 +662,11 @@ namespace
 						m.Name.c_str(), s.swName.c_str());
 			}
 
+		anyGlobalDamage = false;
+		for (auto& m : Meters)
+			if (m.hasGlobalDamage)
+				anyGlobalDamage = true;
+
 		// Build the per-warhead versus lookup (resolve warhead names).
 		WarheadVersusMap.clear();
 		anyVersus = false;
@@ -715,6 +761,7 @@ void Weather::ReadGlobals(CCINIClass* pINI)
 		}
 		ReadFireSlots(pINI, m);
 		ReadMeterVersus(pINI, m);
+		ReadMeterModifiers(pINI, m);
 
 		// Every pass runs before gameplay, so seeding the start here means the
 		// game begins at StartAmount (clamped) for the last pass that ran.
@@ -930,18 +977,33 @@ void Weather::OnSuperWeaponFired(HouseClass* pHouse, int swSlotIndex)
 
 int Weather::AdjustDamage(int damage, WarheadTypeClass* pWH, int armor)
 {
-	if (!Config.Enabled || !anyVersus || !pWH || damage == 0)
+	if (!Config.Enabled || damage == 0 || (!anyVersus && !anyGlobalDamage))
 		return damage;
 	if (!finalized)
 		Finalize();
 
-	auto it = WarheadVersusMap.find(pWH);
-	if (it == WarheadVersusMap.end())
-		return damage;
-
 	double factor = 1.0;
-	for (const auto& rv : it->second)
-		factor *= EvalVersus(*rv.curve, Meters[rv.meterIdx].Amount, armor);
+
+	// Global combat multipliers (every damage event): firepower up, armor down.
+	if (anyGlobalDamage)
+		for (const auto& m : Meters)
+		{
+			if (!m.hasGlobalDamage)
+				continue;
+			factor *= EvalScalar(m.firepower, m.Amount);
+			const double a = EvalScalar(m.armor, m.Amount);
+			if (a > 0.0)
+				factor /= a;
+		}
+
+	// Per-warhead Versus curves.
+	if (pWH)
+	{
+		auto it = WarheadVersusMap.find(pWH);
+		if (it != WarheadVersusMap.end())
+			for (const auto& rv : it->second)
+				factor *= EvalVersus(*rv.curve, Meters[rv.meterIdx].Amount, armor);
+	}
 
 	if (factor == 1.0)
 		return damage;
