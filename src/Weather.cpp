@@ -127,6 +127,12 @@ namespace
 		ScalarCurve firepower;
 		ScalarCurve armor;
 		bool hasGlobalDamage = false;
+
+		// global cost multiplier (P4b): scales every house's build cost. >1 =
+		// pricier war economy. Applied by re-driving HouseClass's own cost
+		// recompute each frame and layering this factor on top.
+		ScalarCurve cost;
+		bool hasCost = false;
 	};
 
 	std::vector<Meter> Meters;
@@ -216,6 +222,7 @@ namespace
 	bool anySWContrib = false;
 	bool anyVersus = false;
 	bool anyGlobalDamage = false;
+	bool anyCostEffect = false;
 	bool finalized = false;
 
 	int logCounter = 0;
@@ -473,6 +480,11 @@ namespace
 		m.armor.multMax = pINI->ReadDouble(s, "Armor.MultMax", m.armor.multMax);
 		m.hasGlobalDamage = (m.firepower.perAmount > 0 && m.firepower.mult != 0.0)
 			|| (m.armor.perAmount > 0 && m.armor.mult != 0.0);
+
+		m.cost.perAmount = pINI->ReadInteger(s, "Cost.PerAmount", m.cost.perAmount);
+		m.cost.mult = pINI->ReadDouble(s, "Cost.Mult", m.cost.mult);
+		m.cost.multMax = pINI->ReadDouble(s, "Cost.MultMax", m.cost.multMax);
+		m.hasCost = (m.cost.perAmount > 0 && m.cost.mult != 0.0);
 	}
 
 	// Evaluate a curve's damage multiplier at the given meter amount + armor.
@@ -663,9 +675,14 @@ namespace
 			}
 
 		anyGlobalDamage = false;
+		anyCostEffect = false;
 		for (auto& m : Meters)
+		{
 			if (m.hasGlobalDamage)
 				anyGlobalDamage = true;
+			if (m.hasCost)
+				anyCostEffect = true;
+		}
 
 		// Build the per-warhead versus lookup (resolve warhead names).
 		WarheadVersusMap.clear();
@@ -1145,6 +1162,33 @@ void Weather::FrameTick()
 					m.Name.c_str(), m.Amount, s.swName.c_str(), launched,
 					pHouse ? pHouse->PlainName : "<none>", interval);
 			}
+		}
+	}
+
+	// --- Effect: global cost multiplier (house-field approach) ---
+	// Re-drive each house's own cost recompute (HouseClass::CalculateCostMultipliers,
+	// 0x50BF60 -- which the game only runs on factory-plant events) so we get the
+	// fresh FactoryPlant base, then layer the weather factor on top. Idempotent
+	// and self-reverting: when the meters relax, W -> 1 and cost returns to base.
+	if (anyCostEffect)
+	{
+		double W = 1.0;
+		for (const auto& m : Meters)
+			if (m.hasCost)
+				W *= EvalScalar(m.cost, m.Amount);
+
+		const float fw = (float)W;
+		for (int i = 0; i < HouseClass::Array.Count; ++i)
+		{
+			HouseClass* pH = HouseClass::Array.Items[i];
+			if (!pH)
+				continue;
+			pH->CalculateCostMultipliers(); // reset to the FactoryPlant base
+			pH->CostInfantryMult *= fw;
+			pH->CostUnitsMult *= fw;
+			pH->CostAircraftMult *= fw;
+			pH->CostBuildingsMult *= fw;
+			pH->CostDefensesMult *= fw;
 		}
 	}
 
