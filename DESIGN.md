@@ -1030,3 +1030,21 @@ artillery shell, acid rain) through the cloud/bolt/impact slots.
 Cloud tracking: each cloud is checked against `AnimClass::Array` every frame
 (never dereferenced if gone); a missing cloud makes the bolt fire at once.
 Pending strikes are capped at 1,000 and not yet saved in savegames.
+
+## Debug logging (all in `[Weather]`)
+
+```ini
+Debug=yes            ; master switch for per-event lines (no = silent; config echo + warnings still print)
+Debug.Lines=40       ; lines per category per game; 0 = unlimited
+Debug.Meters=yes     ; periodic summary every LogInterval frames (meters, pools, effects in flight)
+Debug.Contributors=yes
+Debug.Fire=yes
+Debug.Motion=yes
+Debug.Pools=yes
+Debug.Effects=yes    ; effect start, cloud trigger, every bolt (all pieces + local screen/shroud/fog)
+Debug.Anims=yes      ; every anim an effect creates: born / 1 frame on / ended
+Debug.Damage=yes
+```
+
+Screen position, shroud and fog are the LOCAL player's view and are logged
+only; nothing in logging reads the synced RNG or changes game state.
