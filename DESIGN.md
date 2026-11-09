@@ -977,3 +977,56 @@ map onto a second pool the same way (`Slots.Max`, `Slots.Min`, `Slots.Delay`,
 P6a: time units, meter motion, `WeatherSystem.Motion`. P6b: strike pools with
 patterns, spread, counts, bands, owners, lag guards. Example config:
 `docs/examples/weatherstorm-remake.ini`.
+
+---
+
+# Design rev 5 — strike effects (the vanilla weather-control strike, staged)
+
+A pool can fire an **effect** instead of (or as well as) a superweapon:
+`Strike.Effect=VanillaStrike` (a list, with `Strike.Effect.Chances=`). An
+effect section with no keys **is** the vanilla strike, read from `[General]`.
+
+How vanilla does it (read from gamemd, 2026-11-09):
+
+1. `LightningStorm::Strike` 0x53A140: a random `WeatherConClouds` anim spawns
+   above the cell at `(int)((firstBoltImage.Height/2 - 0.5) * CloudHeightFactor)`
+   leptons over the ground (plus the bridge height on a bridge).
+2. `LightningStorm::Update` 0x53A6C0: once that cloud passes **half its
+   frames**, `Strike2` runs at the cloud's cell.
+3. `LightningStorm::Strike2` 0x53A300: a random `WeatherConBolts` anim at the
+   ground, a random `LightningSounds` sound, the impact anim from
+   `SelectDamageAnimation` (which returns `WeatherConBoltExplosion` for the
+   `LightningWarhead`, a splash on water), the warhead flash, `DamageArea`
+   with `LightningDamage`, and 2-4 `MetallicDebris` anims on bare hard ground.
+
+WeatherExt reimplements this sequence instead of calling the engine because
+Antares replaces all three functions with versions tied to the active storm
+superweapon.
+
+```ini
+[VanillaStrike]               ; every key optional; "none" turns a stage off
+Cloud.Anims=WCCLOUD1,WCCLOUD2,WCCLOUD3   ; [General] WeatherConClouds
+Cloud.Height=auto             ; leptons above ground; auto = vanilla formula
+Bolt.At=half                  ; half | end | <time after the cloud spawns>
+Bolt.Anims=WCLBOLT1,WCLBOLT2,WCLBOLT3    ; [General] WeatherConBolts
+Bolt.Sounds=WeatherStrike     ; [General] LightningSounds
+Bolt.Count=1                  ; bolts from one cloud
+Bolt.Every=0                  ; time between them
+Bolt.Spread=0                 ; each bolt lands within this many cells
+Impact.Anims=                 ; unset = engine pick (WeatherConBoltExplosion)
+Impact.Warhead=IonWH          ; [General] LightningWarhead
+Impact.Damage=250             ; [General] LightningDamage
+Impact.Flash=yes
+Impact.Debris=                ; unset = [General] MetallicDebris
+Impact.Debris.Count=2,4
+```
+
+Other things the same stages make: a dry thunderclap (`Bolt.Anims=none`,
+`Impact.Damage=0`, keep the sound), a cloud that rains several bolts
+(`Bolt.Count=4`, `Bolt.Every=10`, `Bolt.Spread=2`), an instant strike with no
+cloud (`Cloud.Anims=none`), or any anim + warhead combination (meteor,
+artillery shell, acid rain) through the cloud/bolt/impact slots.
+
+Cloud tracking: each cloud is checked against `AnimClass::Array` every frame
+(never dereferenced if gone); a missing cloud makes the bolt fire at once.
+Pending strikes are capped at 1,000 and not yet saved in savegames.
