@@ -29,7 +29,8 @@
 #include <cstdio>
 #include <cstdlib>   // atoi, _itoa_s
 #include <cstring>   // strtok_s, strlen
-#include <cctype>    // tolower
+#include <cctype>    // tolower, isdigit
+#include <climits>   // INT_MIN
 #include <cmath>
 
 Weather::DllConfig Weather::Config;
@@ -133,6 +134,26 @@ namespace
 		// recompute each frame and layering this factor on top.
 		ScalarCurve cost;
 		bool hasCost = false;
+
+		// motion (rev 4): the climb/decline ladder. Direction +1 climb,
+		// -1 decline, 0 stable; StartMotion 2 = random (rolled at start).
+		struct MotionDir
+		{
+			int step = 10;
+			int every = 900;          // frames per step
+			int spreadLo = 0, spreadHi = 0;
+			bool hasTo = false;       // false => edge is Max (climb) / Min (decline)
+			int to = 0;
+			int atEnd = 0;            // 0 reverse, 1 hold, 2 wrap, 3 stop
+			int pause = 0;
+		};
+		int StartMotion = 0;
+		int MotionDelay = 0;
+		MotionDir climb, decline;
+		int dir = 0;                  // runtime
+		int motionTimer = 0;
+		bool motionStarted = false;
+		bool edgePending = false;
 	};
 
 	std::vector<Meter> Meters;
@@ -186,6 +207,7 @@ namespace
 	{
 		std::string meter;
 		int amount = 0;
+		int motion = 0; // MotionCmd (0 = keep); steers the meter's motion
 		int idx = -1; // resolved meter index, or -1 (unknown => skipped)
 	};
 
@@ -295,6 +317,110 @@ namespace
 		}
 	}
 
+	// ---- time values (rev 4) ----------------------------------------------
+	// A bare number is frames; a suffix converts: s = 15 frames, m = 900 frames
+	// (the engine's RechargeTime scale), f = frames. Returned in centi-frames
+	// (frames x 100) so small per-Weight shaves accumulate exactly.
+	// `unitHint` is the multiplier to use when the value carries no suffix.
+	long long ParseTimeCenti(const char* s, double unitHint = 1.0, double* unitOut = nullptr)
+	{
+		if (!s)
+			return 0;
+		while (*s == ' ') ++s;
+		char* end = nullptr;
+		const double v = strtod(s, &end);
+		while (end && *end == ' ') ++end;
+		double unit = unitHint;
+		if (end && *end)
+		{
+			switch (*end)
+			{
+			case 'm': case 'M': unit = 900.0; break;
+			case 's': case 'S': unit = 15.0; break;
+			case 'f': case 'F': unit = 1.0; break;
+			default: break;
+			}
+		}
+		if (unitOut)
+			*unitOut = unit;
+		return std::llround(v * unit * 100.0);
+	}
+
+	int CentiToFrames(long long c)
+	{
+		return static_cast<int>(c >= 0 ? (c + 50) / 100 : -((-c + 50) / 100));
+	}
+
+	int ParseTimeFrames(const char* s)
+	{
+		return CentiToFrames(ParseTimeCenti(s));
+	}
+
+	// Present-only time key in frames.
+	int ReadTime(CCINIClass* pINI, const char* section, const char* key, int current)
+	{
+		if (!pINI->ReadString(section, key, "", WeatherExtDLL::readBuffer, WeatherExtDLL::readLength)
+			|| !*WeatherExtDLL::readBuffer)
+			return current;
+		return ParseTimeFrames(WeatherExtDLL::readBuffer);
+	}
+
+	void ReadTimeList(CCINIClass* pINI, const char* section, const char* key,
+		std::vector<int>& out)
+	{
+		out.clear();
+		if (!pINI->ReadString(section, key, "", WeatherExtDLL::readBuffer, WeatherExtDLL::readLength))
+			return;
+		char* ctx = nullptr;
+		for (char* tok = strtok_s(WeatherExtDLL::readBuffer, ",", &ctx); tok; tok = strtok_s(nullptr, ",", &ctx))
+			out.push_back(ParseTimeFrames(tok));
+	}
+
+	// "lo,hi" time pair. A unit on the LAST value only applies to both, so
+	// "0.5,2s" means 0.5s..2s. Returns frames; hi is forced >= lo.
+	void ParseTimePair(const char* s, int& lo, int& hi)
+	{
+		lo = hi = 0;
+		if (!s || !*s)
+			return;
+		std::string str(s);
+		const size_t comma = str.find(',');
+		if (comma == std::string::npos)
+		{
+			lo = 0;
+			hi = ParseTimeFrames(str.c_str());
+		}
+		else
+		{
+			double unit = 1.0;
+			const long long h = ParseTimeCenti(str.c_str() + comma + 1, 1.0, &unit);
+			const std::string first = str.substr(0, comma);
+			// does the first value carry its own suffix?
+			bool ownUnit = false;
+			for (char ch : first)
+				if (ch == 'm' || ch == 'M' || ch == 's' || ch == 'S' || ch == 'f' || ch == 'F')
+					ownUnit = true;
+			lo = CentiToFrames(ParseTimeCenti(first.c_str(), ownUnit ? 1.0 : unit));
+			hi = CentiToFrames(h);
+		}
+		if (hi < lo)
+			std::swap(lo, hi);
+	}
+
+	// ---- motion (rev 4) ---------------------------------------------------
+	// Contributor command that steers a meter's climb/decline motion.
+	enum class MotionCmd { Keep, Climb, Decline, Stable, Reverse };
+
+	MotionCmd ParseMotionCmd(const char* v)
+	{
+		if (!v) return MotionCmd::Keep;
+		if (_strcmpi(v, "climb") == 0) return MotionCmd::Climb;
+		if (_strcmpi(v, "decline") == 0) return MotionCmd::Decline;
+		if (_strcmpi(v, "stable") == 0) return MotionCmd::Stable;
+		if (_strcmpi(v, "reverse") == 0) return MotionCmd::Reverse;
+		return MotionCmd::Keep;
+	}
+
 	// Build the [warhead/type] contributor list from the parallel .Types /
 	// .Amounts pair. Present-only: if NEITHER key is present, keep whatever was
 	// parsed on an earlier pass; if either is present, this pass defines it.
@@ -302,8 +428,10 @@ namespace
 	{
 		std::vector<std::string> types;
 		std::vector<int> amounts;
+		std::vector<std::string> motions;
 		ReadNameList(pINI, section, "WeatherSystem.Types", types);
 		ReadIntList(pINI, section, "WeatherSystem.Amounts", amounts);
+		ReadNameList(pINI, section, "WeatherSystem.Motion", motions);
 
 		if (types.empty() && amounts.empty())
 			return false; // absent this pass; caller keeps prior value
@@ -314,6 +442,7 @@ namespace
 			Contrib c;
 			c.meter = types[i];
 			c.amount = i < amounts.size() ? amounts[i] : 0;
+			c.motion = i < motions.size() ? (int)ParseMotionCmd(motions[i].c_str()) : 0;
 			out.push_back(std::move(c));
 		}
 		if (amounts.size() != types.size())
@@ -344,10 +473,10 @@ namespace
 		std::vector<int> amounts, counts, intervals, steps, stepAmounts, mins;
 		ReadIntList(pINI, m.Name.c_str(), "Fire.Amounts", amounts);
 		ReadIntList(pINI, m.Name.c_str(), "Fire.Counts", counts);
-		ReadIntList(pINI, m.Name.c_str(), "Fire.Intervals", intervals);
-		ReadIntList(pINI, m.Name.c_str(), "Fire.IntervalStep", steps);
+		ReadTimeList(pINI, m.Name.c_str(), "Fire.Intervals", intervals);
+		ReadTimeList(pINI, m.Name.c_str(), "Fire.IntervalStep", steps);
 		ReadIntList(pINI, m.Name.c_str(), "Fire.IntervalStepAmount", stepAmounts);
-		ReadIntList(pINI, m.Name.c_str(), "Fire.IntervalMin", mins);
+		ReadTimeList(pINI, m.Name.c_str(), "Fire.IntervalMin", mins);
 
 		auto at = [](const std::vector<int>& v, size_t i, int def) {
 			return i < v.size() ? v[i] : def;
@@ -624,6 +753,633 @@ namespace
 		return true;
 	}
 
+	// ---- meter motion (rev 4) ---------------------------------------------
+	int MotionLinesLeft = 40;
+
+	int StepTime(const Meter& m, int dir)
+	{
+		const auto& d = dir > 0 ? m.climb : m.decline;
+		int t = d.every;
+		if (d.spreadHi > d.spreadLo)
+			t += ScenarioClass::Instance->Random.RandomRanged(d.spreadLo, d.spreadHi);
+		else
+			t += d.spreadLo;
+		return std::max(1, t);
+	}
+
+	void ApplyMotionCmd(Meter& m, int cmd)
+	{
+		int nd = m.dir;
+		switch ((MotionCmd)cmd)
+		{
+		case MotionCmd::Climb: nd = 1; break;
+		case MotionCmd::Decline: nd = -1; break;
+		case MotionCmd::Stable: nd = 0; break;
+		case MotionCmd::Reverse:
+			if (m.dir == 0)
+				return; // nothing to reverse; keep any scheduled start
+			nd = -m.dir;
+			break;
+		default:
+			return;
+		}
+		if (nd == m.dir && m.motionStarted)
+			return;
+		m.dir = nd;
+		m.motionStarted = true;
+		m.edgePending = false;
+		if (nd)
+			m.motionTimer = StepTime(m, nd);
+		if (MotionLinesLeft > 0)
+		{
+			--MotionLinesLeft;
+			Debug::Log("[WeatherExt] frame %d: '%s' motion set to %s by a contributor\n",
+				Unsorted::CurrentFrame, m.Name.c_str(), nd > 0 ? "climb" : nd < 0 ? "decline" : "stable");
+		}
+	}
+
+	void TickMotion(Meter& m)
+	{
+		if (!m.motionStarted)
+		{
+			if (m.StartMotion == 0 || Unsorted::CurrentFrame < m.MotionDelay)
+				return;
+			m.motionStarted = true;
+			m.dir = m.StartMotion == 2
+				? (ScenarioClass::Instance->Random.RandomRanged(0, 1) ? 1 : -1)
+				: m.StartMotion;
+			m.motionTimer = StepTime(m, m.dir);
+			return;
+		}
+		if (m.dir == 0 || --m.motionTimer > 0)
+			return;
+
+		const auto& d = m.dir > 0 ? m.climb : m.decline;
+		const int edge = d.hasTo ? d.to : (m.dir > 0 ? m.Max : m.Min);
+		auto atEdge = [&]() { return m.dir > 0 ? m.Amount >= edge : m.Amount <= edge; };
+
+		if (m.edgePending)
+		{
+			m.edgePending = false;
+			const char* what = "hold";
+			switch (d.atEnd)
+			{
+			case 0: m.dir = -m.dir; what = "reverse"; break;
+			case 2:
+			{
+				const auto& o = m.dir > 0 ? m.decline : m.climb;
+				const int other = o.hasTo ? o.to : (m.dir > 0 ? m.Min : m.Max);
+				m.Amount = ClampMeter(m, other);
+				what = "wrap";
+				break;
+			}
+			case 3: m.dir = 0; what = "stop"; break;
+			default: break;
+			}
+			if (MotionLinesLeft > 0 && d.atEnd != 1)
+			{
+				--MotionLinesLeft;
+				Debug::Log("[WeatherExt] frame %d: '%s' reached %d -> %s (now %s, amount %d)\n",
+					Unsorted::CurrentFrame, m.Name.c_str(), edge, what,
+					m.dir > 0 ? "climb" : m.dir < 0 ? "decline" : "stable", m.Amount);
+			}
+			if (m.dir)
+				m.motionTimer = StepTime(m, m.dir);
+			return;
+		}
+
+		if (!atEdge())
+		{
+			int next = m.Amount + m.dir * d.step;
+			next = m.dir > 0 ? std::min(next, edge) : std::max(next, edge);
+			m.Amount = ClampMeter(m, next);
+		}
+		if (atEdge())
+		{
+			m.edgePending = true;
+			m.motionTimer = std::max(1, d.pause);
+			return;
+		}
+		m.motionTimer = StepTime(m, m.dir);
+	}
+
+	// ---- strike pools (rev 4) ---------------------------------------------
+	const char* const POOL_REGISTRY = "WeatherStrikes";
+	constexpr int MAX_POOLS = 64;
+	constexpr int MAX_POOL_SLOTS = 2000;
+
+	enum class Pattern { Global, Even, Climb, Decline };
+	enum class PatternSwitch { Never, Every, Random, Motion, Saturated };
+	const char* PatternName(Pattern p)
+	{
+		switch (p)
+		{
+		case Pattern::Even: return "even";
+		case Pattern::Climb: return "climb";
+		case Pattern::Decline: return "decline";
+		default: return "global";
+		}
+	}
+
+	// One complete parameter set. A pool holds one per Weight band.
+	struct PoolParams
+	{
+		int perWeight = 10;
+		int slotsMin = 0;
+		int slotsMax = 500;
+		int delay = 0;
+		bool newReady = true;
+		bool removeNewest = true;
+
+		long long rMaxC = 900LL * 10 * 100; // 10m, centi-frames
+		long long rMinC = 0;                // defaults to rMaxC unless set
+		long long shaveC = 0;               // centi-frames per shavePer Weight
+		int shavePer = 1;
+		int shaveFrom = 0;
+		int spreadLo = 0, spreadHi = 0;     // frames
+		std::vector<Pattern> patterns{ Pattern::Global };
+		PatternSwitch patternSwitch = PatternSwitch::Never;
+		int patternEvery = 900 * 5;
+		bool live = false;
+
+		std::vector<std::string> swNames;
+		std::vector<int> swIdx;
+		std::vector<int> chances;
+		int count = 1;
+		int countAdd = 0, countAddPer = 1;
+		int countMax = 0;                   // 0 => no cap (hard ceiling 100)
+		int gap = 0;
+		int perFrame = 2;
+		TargetMode target = TargetMode::Random;
+		std::string owner = "neutral";
+		bool grant = true;
+	};
+
+	// Lower-cased key -> value, merged across INI passes (later pass wins), so
+	// every pool key is present-only and a lobby file needs only what it changes.
+	using RawMap = std::unordered_map<std::string, std::string>;
+
+	struct Pool
+	{
+		std::string Name;
+		RawMap raw;
+		std::vector<std::string> sysNames;
+		std::vector<double> factors;
+		std::vector<int> sysIdx;
+		std::vector<int> floors;            // ascending; floors[0] = INT_MIN
+		std::vector<PoolParams> bands;      // parallel to floors
+
+		// runtime
+		std::vector<int> timers;            // frames until each slot fires
+		std::vector<int> totals;            // each slot's current base reload (Live)
+		int patternPos = 0;
+		int patternTimer = 0;
+		bool wasSaturated = false;
+		int gapTimer = 0;
+		int cursor = 0;
+		int shots = 0;
+		int weight = 0;
+		int band = 0;
+	};
+	std::vector<Pool> Pools;
+	bool anyPools = false;
+
+	std::vector<std::string> SplitList(const std::string& s)
+	{
+		std::vector<std::string> out;
+		size_t i = 0;
+		while (i <= s.size())
+		{
+			size_t j = s.find(',', i);
+			if (j == std::string::npos) j = s.size();
+			size_t a = i, b = j;
+			while (a < b && s[a] == ' ') ++a;
+			while (b > a && s[b - 1] == ' ') --b;
+			out.push_back(s.substr(a, b - a));
+			i = j + 1;
+		}
+		return out;
+	}
+
+	bool ParseBool(const std::string& v, bool current)
+	{
+		if (v.empty()) return current;
+		switch (v[0])
+		{
+		case '1': case 't': case 'T': case 'y': case 'Y': return true;
+		case '0': case 'f': case 'F': case 'n': case 'N': return false;
+		default: return current;
+		}
+	}
+
+	// Numeric last segment ("strike.sw.3000") -> base + floor. Returns false
+	// for plain keys.
+	bool SplitBand(const std::string& key, std::string& base, int& floor)
+	{
+		const size_t dot = key.rfind('.');
+		if (dot == std::string::npos || dot + 1 >= key.size())
+			return false;
+		size_t k = dot + 1;
+		if (key[k] == '-') ++k;
+		if (k >= key.size())
+			return false;
+		for (size_t q = k; q < key.size(); ++q)
+			if (!isdigit((unsigned char)key[q]))
+				return false;
+		base = key.substr(0, dot);
+		floor = atoi(key.c_str() + dot + 1);
+		return true;
+	}
+
+	// Apply every pool key found under `suffix` ("" = plain, ".3000" = band).
+	void ApplyPoolKeys(PoolParams& p, bool& minSet, const RawMap& raw,
+		const std::string& suffix, const char* pool)
+	{
+		auto get = [&](const char* base) -> const std::string* {
+			auto it = raw.find(Lower(base) + suffix);
+			return (it != raw.end() && !it->second.empty()) ? &it->second : nullptr;
+		};
+		const std::string* v;
+
+		if ((v = get("Slots.PerWeight"))) p.perWeight = std::max(1, atoi(v->c_str()));
+		if ((v = get("Slots.Min"))) p.slotsMin = std::max(0, atoi(v->c_str()));
+		if ((v = get("Slots.Max"))) p.slotsMax = std::clamp(atoi(v->c_str()), 0, MAX_POOL_SLOTS);
+		if ((v = get("Slots.Delay"))) p.delay = ParseTimeFrames(v->c_str());
+		if ((v = get("Slots.NewReady"))) p.newReady = ParseBool(*v, p.newReady);
+		if ((v = get("Slots.Remove"))) p.removeNewest = _strcmpi(v->c_str(), "oldest") != 0;
+
+		if ((v = get("Recharge.Max"))) p.rMaxC = std::max(100LL, ParseTimeCenti(v->c_str()));
+		if ((v = get("Recharge.Min"))) { p.rMinC = std::max(100LL, ParseTimeCenti(v->c_str())); minSet = true; }
+		if ((v = get("Recharge.Shave")))
+		{
+			auto parts = SplitList(*v);
+			p.shaveC = std::max(0LL, ParseTimeCenti(parts[0].c_str()));
+			p.shavePer = parts.size() > 1 ? std::max(1, atoi(parts[1].c_str())) : 1;
+		}
+		if ((v = get("Recharge.ShaveFrom"))) p.shaveFrom = atoi(v->c_str());
+		if ((v = get("Recharge.Spread"))) ParseTimePair(v->c_str(), p.spreadLo, p.spreadHi);
+		if ((v = get("Recharge.Pattern")))
+		{
+			p.patterns.clear();
+			for (auto& n : SplitList(*v))
+			{
+				if (_strcmpi(n.c_str(), "global") == 0) p.patterns.push_back(Pattern::Global);
+				else if (_strcmpi(n.c_str(), "even") == 0) p.patterns.push_back(Pattern::Even);
+				else if (_strcmpi(n.c_str(), "climb") == 0) p.patterns.push_back(Pattern::Climb);
+				else if (_strcmpi(n.c_str(), "decline") == 0) p.patterns.push_back(Pattern::Decline);
+				else if (!n.empty())
+					Debug::Log("[WeatherExt] pool '%s': unknown Recharge.Pattern '%s' "
+						"(global|even|climb|decline); skipped.\n", pool, n.c_str());
+			}
+			if (p.patterns.empty())
+				p.patterns.push_back(Pattern::Global);
+		}
+		if ((v = get("Recharge.Pattern.Switch")))
+		{
+			const char* s = v->c_str();
+			if (_strcmpi(s, "every") == 0) p.patternSwitch = PatternSwitch::Every;
+			else if (_strcmpi(s, "random") == 0) p.patternSwitch = PatternSwitch::Random;
+			else if (_strcmpi(s, "motion") == 0) p.patternSwitch = PatternSwitch::Motion;
+			else if (_strcmpi(s, "saturated") == 0) p.patternSwitch = PatternSwitch::Saturated;
+			else p.patternSwitch = PatternSwitch::Never;
+		}
+		if ((v = get("Recharge.Pattern.Every"))) p.patternEvery = std::max(1, ParseTimeFrames(v->c_str()));
+		if ((v = get("Recharge.Live"))) p.live = ParseBool(*v, p.live);
+
+		if ((v = get("Strike.SW")))
+		{
+			p.swNames.clear();
+			for (auto& n : SplitList(*v))
+				if (!n.empty())
+					p.swNames.push_back(n);
+		}
+		if ((v = get("Strike.SW.Chances")))
+		{
+			p.chances.clear();
+			for (auto& n : SplitList(*v))
+				p.chances.push_back(std::max(0, atoi(n.c_str())));
+		}
+		if ((v = get("Strike.Count"))) p.count = std::max(0, atoi(v->c_str()));
+		if ((v = get("Strike.Count.Add")))
+		{
+			auto parts = SplitList(*v);
+			p.countAdd = atoi(parts[0].c_str());
+			p.countAddPer = parts.size() > 1 ? std::max(1, atoi(parts[1].c_str())) : 1;
+		}
+		if ((v = get("Strike.Count.Max"))) p.countMax = std::max(0, atoi(v->c_str()));
+		if ((v = get("Strike.Gap"))) p.gap = std::max(0, ParseTimeFrames(v->c_str()));
+		if ((v = get("Strike.PerFrame"))) p.perFrame = std::max(1, atoi(v->c_str()));
+		if ((v = get("Strike.Target")))
+			p.target = _strcmpi(v->c_str(), "mapcenter") == 0 ? TargetMode::MapCenter : TargetMode::Random;
+		if ((v = get("Strike.Owner"))) p.owner = *v;
+		if ((v = get("Strike.Grant"))) p.grant = ParseBool(*v, p.grant);
+	}
+
+	// Rebuild a pool's band table from its merged raw keys.
+	void BuildPoolBands(Pool& pool)
+	{
+		std::vector<int> floors;
+		for (auto& kv : pool.raw)
+		{
+			std::string base;
+			int f;
+			if (SplitBand(kv.first, base, f))
+				floors.push_back(f);
+		}
+		std::sort(floors.begin(), floors.end());
+		floors.erase(std::unique(floors.begin(), floors.end()), floors.end());
+
+		pool.sysNames.clear();
+		pool.factors.clear();
+		auto it = pool.raw.find("weight.systems");
+		if (it != pool.raw.end())
+			for (auto& n : SplitList(it->second))
+				if (!n.empty())
+					pool.sysNames.push_back(n);
+		it = pool.raw.find("weight.factors");
+		if (it != pool.raw.end())
+			for (auto& n : SplitList(it->second))
+				pool.factors.push_back(n.empty() ? 1.0 : atof(n.c_str()));
+		pool.factors.resize(pool.sysNames.size(), 1.0);
+
+		auto fixed = [&](PoolParams p, bool minSet) {
+			if (!minSet)
+				p.rMinC = p.rMaxC;
+			if (p.rMinC > p.rMaxC)
+			{
+				Debug::Log("[WeatherExt] pool '%s': Recharge.Min > Recharge.Max; "
+					"using Max for both.\n", pool.Name.c_str());
+				p.rMinC = p.rMaxC;
+			}
+			if (p.slotsMax < p.slotsMin)
+				p.slotsMax = p.slotsMin;
+			return p;
+		};
+
+		PoolParams cur;
+		bool minSet = false;
+		ApplyPoolKeys(cur, minSet, pool.raw, "", pool.Name.c_str());
+		pool.floors = { INT_MIN };
+		pool.bands = { fixed(cur, minSet) };
+		for (int f : floors)
+		{
+			ApplyPoolKeys(cur, minSet, pool.raw, "." + std::to_string(f), pool.Name.c_str());
+			pool.floors.push_back(f);
+			pool.bands.push_back(fixed(cur, minSet));
+		}
+	}
+
+	void ResetPoolRuntime(Pool& p)
+	{
+		p.timers.clear();
+		p.totals.clear();
+		p.patternPos = 0;
+		p.patternTimer = 0;
+		p.wasSaturated = false;
+		p.gapTimer = 0;
+		p.cursor = 0;
+		p.shots = 0;
+		p.weight = 0;
+		p.band = 0;
+	}
+
+	int PoolWeight(const Pool& p)
+	{
+		double w = 0.0;
+		for (size_t i = 0; i < p.sysIdx.size(); ++i)
+			if (p.sysIdx[i] >= 0)
+				w += p.factors[i] * Meters[p.sysIdx[i]].Amount;
+		return static_cast<int>(std::lround(w));
+	}
+
+	long long ShaveBudget(const PoolParams& P, int w)
+	{
+		if (P.shaveC <= 0 || w <= P.shaveFrom)
+			return 0;
+		return P.shaveC * (long long)(w - P.shaveFrom) / P.shavePer;
+	}
+
+	bool PatternSaturated(const PoolParams& P, Pattern pat, int w, int n)
+	{
+		const long long R = P.rMaxC - P.rMinC;
+		if (R <= 0 || n <= 0)
+			return true;
+		const long long B = ShaveBudget(P, w);
+		switch (pat)
+		{
+		case Pattern::Global: return B >= R;
+		case Pattern::Even: return B / n >= R;
+		default: return B >= R * n;
+		}
+	}
+
+	// Base reload (frames, no spread) for slot i of n under `pat`.
+	int SlotBase(const PoolParams& P, Pattern pat, int w, int i, int n)
+	{
+		const long long R = std::max(0LL, P.rMaxC - P.rMinC);
+		const long long B = ShaveBudget(P, w);
+		long long s = 0;
+		switch (pat)
+		{
+		case Pattern::Global: s = std::min(B, R); break;
+		case Pattern::Even: s = n > 0 ? std::min(B / n, R) : 0; break;
+		case Pattern::Climb: s = std::clamp(B - (long long)i * R, 0LL, R); break;
+		case Pattern::Decline: s = std::clamp(B - (long long)(n - 1 - i) * R, 0LL, R); break;
+		}
+		return std::max(1, CentiToFrames(P.rMaxC - s));
+	}
+
+	int RollSpread(const PoolParams& P)
+	{
+		if (P.spreadHi > P.spreadLo)
+			return ScenarioClass::Instance->Random.RandomRanged(P.spreadLo, P.spreadHi);
+		return P.spreadLo;
+	}
+
+	Pattern ActivePattern(Pool& pool, const PoolParams& P, int w, int n)
+	{
+		const int np = (int)P.patterns.size();
+		if (np == 0)
+			return Pattern::Global;
+		switch (P.patternSwitch)
+		{
+		case PatternSwitch::Every:
+			if (++pool.patternTimer >= P.patternEvery)
+			{
+				pool.patternTimer = 0;
+				pool.patternPos = (pool.patternPos + 1) % np;
+			}
+			break;
+		case PatternSwitch::Random:
+			if (++pool.patternTimer >= P.patternEvery)
+			{
+				pool.patternTimer = 0;
+				pool.patternPos = ScenarioClass::Instance->Random.RandomRanged(0, np - 1);
+			}
+			break;
+		case PatternSwitch::Motion:
+		{
+			const int d = (!pool.sysIdx.empty() && pool.sysIdx[0] >= 0) ? Meters[pool.sysIdx[0]].dir : 0;
+			return d > 0 ? P.patterns[0] : d < 0 ? P.patterns[1 % np] : (np >= 3 ? P.patterns[2] : P.patterns[0]);
+		}
+		case PatternSwitch::Saturated:
+		{
+			const bool sat = PatternSaturated(P, P.patterns[pool.patternPos % np], w, n);
+			if (sat && !pool.wasSaturated)
+				pool.patternPos = (pool.patternPos + 1) % np;
+			pool.wasSaturated = sat;
+			break;
+		}
+		default:
+			return P.patterns[0];
+		}
+		return P.patterns[pool.patternPos % np];
+	}
+
+	int PickPoolSW(const PoolParams& P)
+	{
+		const int n = (int)P.swIdx.size();
+		if (n == 0)
+			return -1;
+		if (n == 1)
+			return P.swIdx[0];
+		int total = 0;
+		for (int i = 0; i < n; ++i)
+			total += i < (int)P.chances.size() ? P.chances[i] : 1;
+		if (total <= 0)
+			return P.swIdx[0];
+		int roll = ScenarioClass::Instance->Random.RandomRanged(0, total - 1);
+		for (int i = 0; i < n; ++i)
+		{
+			roll -= i < (int)P.chances.size() ? P.chances[i] : 1;
+			if (roll < 0)
+				return P.swIdx[i];
+		}
+		return P.swIdx[n - 1];
+	}
+
+	// Fire one shot (Strike.Count SWs) for the pool. Returns SWs launched.
+	int FirePoolShot(const PoolParams& P, int w)
+	{
+		long long count = P.count;
+		if (P.countAdd != 0 && w > 0)
+			count += (long long)(w / P.countAddPer) * P.countAdd;
+		count = std::clamp(count, 0LL, (long long)(P.countMax > 0 ? P.countMax : 100));
+
+		const bool eachHuman = _strcmpi(P.owner.c_str(), "each-human") == 0;
+		const bool eachPlayer = _strcmpi(P.owner.c_str(), "each-player") == 0;
+		int launched = 0;
+		for (int k = 0; k < (int)count; ++k)
+		{
+			const int sw = PickPoolSW(P);
+			if (sw < 0)
+				continue;
+			if (eachHuman || eachPlayer)
+			{
+				for (int i = 0; i < HouseClass::Array.Count; ++i)
+				{
+					HouseClass* pH = HouseClass::Array.Items[i];
+					if (!pH || pH->Defeated || pH->IsNeutral() || pH->IsObserver())
+						continue;
+					if (eachHuman && !pH->IsHumanPlayer)
+						continue;
+					if (FireOneSW(pH, sw, P.grant, PickTargetCell(P.target)))
+						++launched;
+				}
+			}
+			else if (FireOneSW(ResolveFiringHouse(P.owner), sw, P.grant, PickTargetCell(P.target)))
+				++launched;
+		}
+		return launched;
+	}
+
+	void TickPool(Pool& pool)
+	{
+		const int w = PoolWeight(pool);
+		pool.weight = w;
+		int b = 0;
+		while (b + 1 < (int)pool.floors.size() && pool.floors[b + 1] <= w)
+			++b;
+		pool.band = b;
+		const PoolParams& P = pool.bands[b];
+		if (Unsorted::CurrentFrame < P.delay)
+			return;
+
+		int n = w > 0 ? w / P.perWeight : 0;
+		n = std::clamp(n, P.slotsMin, P.slotsMax);
+		const Pattern pat = ActivePattern(pool, P, w, n);
+
+		// resize: grow with fresh slots, shrink from the newest (or oldest) end
+		while ((int)pool.timers.size() > n)
+		{
+			if (P.removeNewest)
+			{
+				pool.timers.pop_back();
+				pool.totals.pop_back();
+			}
+			else
+			{
+				pool.timers.erase(pool.timers.begin());
+				pool.totals.erase(pool.totals.begin());
+			}
+		}
+		while ((int)pool.timers.size() < n)
+		{
+			const int i = (int)pool.timers.size();
+			const int base = SlotBase(P, pat, w, i, n);
+			pool.totals.push_back(base);
+			pool.timers.push_back(P.newReady ? 0 : base + RollSpread(P));
+		}
+		if (n == 0)
+			return;
+		if (pool.cursor >= n)
+			pool.cursor = 0;
+
+		// Live: running reloads rescale to the new target
+		if (P.live)
+			for (int i = 0; i < n; ++i)
+			{
+				const int nb = SlotBase(P, pat, w, i, n);
+				if (pool.totals[i] > 0 && nb != pool.totals[i] && pool.timers[i] > 0)
+					pool.timers[i] = (int)((long long)pool.timers[i] * nb / pool.totals[i]);
+				pool.totals[i] = nb;
+			}
+
+		for (int& t : pool.timers)
+			if (t > 0)
+				--t;
+		if (pool.gapTimer > 0)
+			--pool.gapTimer;
+
+		int shotsNow = 0;
+		int last = -1;
+		for (int k = 0; k < n; ++k)
+		{
+			if (shotsNow >= P.perFrame || pool.gapTimer > 0)
+				break;
+			const int i = (pool.cursor + k) % n;
+			if (pool.timers[i] > 0)
+				continue;
+			const int launched = FirePoolShot(P, w);
+			const int base = SlotBase(P, pat, w, i, n);
+			pool.totals[i] = base;
+			pool.timers[i] = base + RollSpread(P);
+			pool.gapTimer = P.gap;
+			++shotsNow;
+			++pool.shots;
+			last = i;
+			if (fireLinesLeft > 0)
+			{
+				--fireLinesLeft;
+				Debug::Log("[WeatherExt] frame %d: pool '%s' weight=%d slot %d/%d fired x%d "
+					"(%s, next in %df)\n", Unsorted::CurrentFrame, pool.Name.c_str(), w,
+					i + 1, n, launched, PatternName(pat), pool.timers[i]);
+			}
+		}
+		if (last >= 0)
+			pool.cursor = (last + 1) % n;
+	}
+
 	// Resolve every contributor's meter name to an index, once. Unknown names
 	// are logged (typo detection) and left at idx = -1 so they're skipped.
 	void Finalize()
@@ -673,6 +1429,43 @@ namespace
 						"superweapon '%s'; that slot is disabled.\n",
 						m.Name.c_str(), s.swName.c_str());
 			}
+
+		// Resolve strike pools: meter names per pool, SW names per band.
+		anyPools = false;
+		for (auto& pool : Pools)
+		{
+			pool.sysIdx.clear();
+			for (auto& n : pool.sysNames)
+			{
+				auto it = MeterIndex.find(n);
+				pool.sysIdx.push_back(it != MeterIndex.end() ? it->second : -1);
+				if (it == MeterIndex.end())
+					Debug::Log("[WeatherExt] pool '%s' Weight.Systems names unknown "
+						"weather system '%s'; ignored.\n", pool.Name.c_str(), n.c_str());
+			}
+			bool anySW = false;
+			for (auto& P : pool.bands)
+			{
+				P.swIdx.clear();
+				for (auto& n : P.swNames)
+				{
+					const int idx = SuperWeaponTypeClass::FindIndex(n.c_str());
+					if (idx < 0)
+						Debug::Log("[WeatherExt] pool '%s' Strike.SW names unknown "
+							"superweapon '%s'; skipped.\n", pool.Name.c_str(), n.c_str());
+					else
+					{
+						P.swIdx.push_back(idx);
+						anySW = true;
+					}
+				}
+			}
+			if (pool.sysNames.empty())
+				Debug::Log("[WeatherExt] pool '%s' has no Weight.Systems; it never fires.\n",
+					pool.Name.c_str());
+			if (anySW && !pool.sysNames.empty())
+				anyPools = true;
+		}
 
 		anyGlobalDamage = false;
 		anyCostEffect = false;
@@ -770,7 +1563,7 @@ void Weather::ReadGlobals(CCINIClass* pINI)
 		m.Max = pINI->ReadInteger(s, "Max", m.Max);
 		m.Baseline = pINI->ReadInteger(s, "Baseline", m.Baseline);
 		m.Decay = pINI->ReadInteger(s, "Decay", m.Decay);
-		m.DecayRate = std::max(1, pINI->ReadInteger(s, "DecayRate", m.DecayRate));
+		m.DecayRate = std::max(1, ReadTime(pINI, s, "DecayRate", m.DecayRate));
 		if (m.Max < m.Min)
 		{
 			Debug::Log("[WeatherExt] [%s] Max=%d < Min=%d; swapping.\n", s, m.Max, m.Min);
@@ -780,11 +1573,107 @@ void Weather::ReadGlobals(CCINIClass* pINI)
 		ReadMeterVersus(pINI, m);
 		ReadMeterModifiers(pINI, m);
 
+		// motion (rev 4), present-only
+		if (pINI->ReadString(s, "Motion", "", WeatherExtDLL::readBuffer, WeatherExtDLL::readLength) && *WeatherExtDLL::readBuffer)
+		{
+			const char* v = WeatherExtDLL::readBuffer;
+			if (_strcmpi(v, "climb") == 0) m.StartMotion = 1;
+			else if (_strcmpi(v, "decline") == 0) m.StartMotion = -1;
+			else if (_strcmpi(v, "random") == 0) m.StartMotion = 2;
+			else m.StartMotion = 0;
+		}
+		m.MotionDelay = std::max(0, ReadTime(pINI, s, "Motion.Delay", m.MotionDelay));
+		auto readDir = [&](const char* prefix, Meter::MotionDir& d)
+		{
+			char key[64];
+			_snprintf_s(key, sizeof(key), "%s.Step", prefix);
+			d.step = std::max(0, pINI->ReadInteger(s, key, d.step));
+			_snprintf_s(key, sizeof(key), "%s.Every", prefix);
+			d.every = std::max(1, ReadTime(pINI, s, key, d.every));
+			_snprintf_s(key, sizeof(key), "%s.Spread", prefix);
+			if (pINI->ReadString(s, key, "", WeatherExtDLL::readBuffer, WeatherExtDLL::readLength) && *WeatherExtDLL::readBuffer)
+				ParseTimePair(WeatherExtDLL::readBuffer, d.spreadLo, d.spreadHi);
+			_snprintf_s(key, sizeof(key), "%s.To", prefix);
+			if (pINI->ReadString(s, key, "", WeatherExtDLL::readBuffer, WeatherExtDLL::readLength) && *WeatherExtDLL::readBuffer)
+			{
+				d.hasTo = true;
+				d.to = atoi(WeatherExtDLL::readBuffer);
+			}
+			_snprintf_s(key, sizeof(key), "%s.AtEnd", prefix);
+			if (pINI->ReadString(s, key, "", WeatherExtDLL::readBuffer, WeatherExtDLL::readLength) && *WeatherExtDLL::readBuffer)
+			{
+				const char* v = WeatherExtDLL::readBuffer;
+				d.atEnd = _strcmpi(v, "hold") == 0 ? 1 : _strcmpi(v, "wrap") == 0 ? 2
+					: _strcmpi(v, "stop") == 0 ? 3 : 0;
+			}
+			_snprintf_s(key, sizeof(key), "%s.Pause", prefix);
+			d.pause = std::max(0, ReadTime(pINI, s, key, d.pause));
+		};
+		readDir("Climb", m.climb);
+		readDir("Decline", m.decline);
+
 		// Every pass runs before gameplay, so seeding the start here means the
 		// game begins at StartAmount (clamped) for the last pass that ran.
 		m.Amount = ClampMeter(m, m.StartAmount);
 		m.decayCounter = 0;
+		m.dir = 0;
+		m.motionTimer = 0;
+		m.motionStarted = false;
+		m.edgePending = false;
 	}
+
+	// Strike pools (rev 4): registry present-only, each pool's keys merged
+	// into its raw map so later passes (gamemode, map, lobby files) only need
+	// the keys they change.
+	{
+		std::vector<std::string> poolNames;
+		char key[16];
+		for (int i = 0; i < MAX_POOLS; ++i)
+		{
+			_itoa_s(i, key, 10);
+			if (!pINI->ReadString(POOL_REGISTRY, key, "", WeatherExtDLL::readBuffer, WeatherExtDLL::readLength)
+				|| !*WeatherExtDLL::readBuffer)
+				break;
+			poolNames.emplace_back(WeatherExtDLL::readBuffer);
+		}
+		if (!poolNames.empty())
+		{
+			std::unordered_map<std::string, RawMap> prior;
+			for (auto& p : Pools)
+				prior[p.Name] = std::move(p.raw);
+			Pools.clear();
+			for (auto& n : poolNames)
+			{
+				Pool p;
+				p.Name = n;
+				auto it = prior.find(n);
+				if (it != prior.end())
+					p.raw = std::move(it->second);
+				Pools.push_back(std::move(p));
+			}
+		}
+		for (auto& p : Pools)
+		{
+			const int nk = pINI->GetKeyCount(p.Name.c_str());
+			for (int i = 0; i < nk; ++i)
+			{
+				const char* k = pINI->GetKeyName(p.Name.c_str(), i);
+				if (!k || !*k)
+					continue;
+				std::string lk = Lower(k);
+				pINI->ReadString(p.Name.c_str(), k, "", WeatherExtDLL::readBuffer, WeatherExtDLL::readLength);
+				// normalise a band suffix ("x.03000" -> "x.3000") so lookups match
+				std::string base;
+				int f;
+				if (SplitBand(lk, base, f))
+					lk = base + "." + std::to_string(f);
+				p.raw[lk] = WeatherExtDLL::readBuffer;
+			}
+			BuildPoolBands(p);
+			ResetPoolRuntime(p);
+		}
+	}
+	MotionLinesLeft = 40;
 
 	logCounter = 0;
 	detLinesLeft = DET_LINE_BUDGET;
@@ -800,9 +1689,22 @@ void Weather::ReadGlobals(CCINIClass* pINI)
 			Meters.size());
 		for (auto& m : Meters)
 			Debug::Log("[WeatherExt]   meter '%s': start=%d range=[%d,%d] "
-				"baseline=%d decay=%d/%df fireSlots=%zu owner=%s\n",
+				"baseline=%d decay=%d/%df fireSlots=%zu owner=%s motion=%d "
+				"(delay %df, climb %d/%df, decline %d/%df)\n",
 				m.Name.c_str(), m.StartAmount, m.Min, m.Max, m.Baseline,
-				m.Decay, m.DecayRate, m.fireSlots.size(), m.owner.c_str());
+				m.Decay, m.DecayRate, m.fireSlots.size(), m.owner.c_str(),
+				m.StartMotion, m.MotionDelay, m.climb.step, m.climb.every,
+				m.decline.step, m.decline.every);
+		for (auto& p : Pools)
+		{
+			const PoolParams& P = p.bands.front();
+			Debug::Log("[WeatherExt]   pool '%s': systems=%zu bands=%zu perWeight=%d "
+				"slots=[%d,%d] recharge=[%d,%d]f shave=%lld/%d spread=[%d,%d]f "
+				"patterns=%zu sw=%zu owner=%s\n", p.Name.c_str(), p.sysNames.size(),
+				p.bands.size(), P.perWeight, P.slotsMin, P.slotsMax,
+				CentiToFrames(P.rMinC), CentiToFrames(P.rMaxC), P.shaveC, P.shavePer,
+				P.spreadLo, P.spreadHi, P.patterns.size(), P.swNames.size(), P.owner.c_str());
+		}
 	}
 }
 
@@ -836,7 +1738,7 @@ void Weather::ReadTechnoType(TechnoTypeClass* pType, CCINIClass* pINI)
 		auto it = TechnoContribMap.find(pType);
 		if (it == TechnoContribMap.end())
 			return;
-		it->second.rate = std::max(0, pINI->ReadInteger(pType->ID, "WeatherSystem.Rate", it->second.rate));
+		it->second.rate = std::max(0, ReadTime(pINI, pType->ID, "WeatherSystem.Rate", it->second.rate));
 		it->second.requiresPower = ReadBoolKeepCurrent(pINI, pType->ID, "WeatherSystem.RequiresPower", it->second.requiresPower);
 		finalized = false;
 		return;
@@ -851,7 +1753,7 @@ void Weather::ReadTechnoType(TechnoTypeClass* pType, CCINIClass* pINI)
 
 	TechnoContrib tc;
 	tc.list = std::move(list);
-	tc.rate = std::max(0, pINI->ReadInteger(pType->ID, "WeatherSystem.Rate", 0));
+	tc.rate = std::max(0, ReadTime(pINI, pType->ID, "WeatherSystem.Rate", 0));
 	tc.requiresPower = ReadBoolKeepCurrent(pINI, pType->ID, "WeatherSystem.RequiresPower", false);
 	if (tc.rate <= 0)
 		Debug::Log("[WeatherExt] [%s] has WeatherSystem.Types but no "
@@ -899,7 +1801,7 @@ void Weather::ReadSuperWeaponType(SuperWeaponTypeClass* pSW, CCINIClass* pINI)
 			sc.interval = 0;
 		}
 		else
-			sc.interval = std::max(0, atoi(WeatherExtDLL::readBuffer));
+			sc.interval = std::max(0, ParseTimeFrames(WeatherExtDLL::readBuffer));
 	}
 
 	SWContribMap[pSW] = std::move(sc);
@@ -922,6 +1824,8 @@ void Weather::OnDetonation(WarheadTypeClass* pWH, TechnoClass* pSource, HouseCla
 		if (c.idx < 0)
 			continue;
 		Meter& m = Meters[c.idx];
+		if (c.motion)
+			ApplyMotionCmd(m, c.motion);
 		const int delta = Scaled(c.amount);
 		if (delta == 0)
 			continue;
@@ -965,6 +1869,8 @@ void Weather::OnSuperWeaponFired(HouseClass* pHouse, int swSlotIndex)
 		if (idx < 0)
 			continue;
 		Meter& m = Meters[idx];
+		if (sc.start[i].motion)
+			ApplyMotionCmd(m, sc.start[i].motion);
 
 		// START delta, now.
 		const int startDelta = Scaled(sc.start[i].amount);
@@ -1110,12 +2016,18 @@ void Weather::FrameTick()
 				if (c.idx < 0)
 					continue;
 				Meter& m = Meters[c.idx];
+				if (c.motion)
+					ApplyMotionCmd(m, c.motion);
 				const int delta = Scaled(c.amount);
 				if (delta != 0)
 					m.Amount = ClampMeter(m, m.Amount + delta);
 			}
 		}
 	}
+
+	// --- meter motion (rev 4): the climb/decline ladder ---
+	for (auto& m : Meters)
+		TickMotion(m);
 
 	// --- Effect 1: threshold-gated superweapon firing ---
 	// Deterministic: meters in registry order, slots in list order, timers
@@ -1165,6 +2077,11 @@ void Weather::FrameTick()
 		}
 	}
 
+	// --- Effect: strike pools (rev 4) ---
+	if (anyPools)
+		for (auto& pool : Pools)
+			TickPool(pool);
+
 	// --- Effect: global cost multiplier (house-field approach) ---
 	// Re-drive each house's own cost recompute (HouseClass::CalculateCostMultipliers,
 	// 0x50BF60 -- which the game only runs on factory-plant events) so we get the
@@ -1197,8 +2114,13 @@ void Weather::FrameTick()
 	{
 		logCounter = 0;
 		for (auto& m : Meters)
-			Debug::Log("[WeatherExt] frame %d: '%s' = %d\n",
-				Unsorted::CurrentFrame, m.Name.c_str(), m.Amount);
+			Debug::Log("[WeatherExt] frame %d: '%s' = %d (%s)\n",
+				Unsorted::CurrentFrame, m.Name.c_str(), m.Amount,
+				m.dir > 0 ? "climb" : m.dir < 0 ? "decline" : "stable");
+		for (auto& p : Pools)
+			Debug::Log("[WeatherExt] frame %d: pool '%s' weight=%d band=%d slots=%zu shots=%d\n",
+				Unsorted::CurrentFrame, p.Name.c_str(), p.weight, p.band,
+				p.timers.size(), p.shots);
 	}
 }
 

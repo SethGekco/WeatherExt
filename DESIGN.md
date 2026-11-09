@@ -962,8 +962,8 @@ map onto a second pool the same way (`Slots.Max`, `Slots.Min`, `Slots.Delay`,
 
 ## Runtime rules
 
-- Order per frame: pending pulses -> decay -> **motion** -> passive contributors
-  -> `Fire.*` slots -> **pools** -> cost. Meters and pools in registry order,
+- Order per frame: pending pulses -> decay -> passive contributors ->
+  **motion** -> `Fire.*` slots -> **pools** -> cost. Meters and pools in registry order,
   slots in index order, a rotating start slot so `Strike.PerFrame` never starves
   the same slots.
 - All randomness (`random` motion, spreads, `Strike.SW.Chances`, targets,
