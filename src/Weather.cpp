@@ -22,6 +22,7 @@
 #include <RulesClass.h>
 #include <VocClass.h>
 #include <Memory.h>
+#include <TacticalClass.h>
 #include <Fundamentals.h>
 #include <GeneralDefinitions.h>
 
@@ -46,7 +47,48 @@ namespace
 	const char* const CFG_SECTION = "Weather";
 	const char* const REGISTRY = "WeatherSystems";
 	constexpr int MAX_METERS = 256;      // registry sanity cap
-	constexpr int DET_LINE_BUDGET = 20;  // per-game individual detonation lines
+	// ---- debug logging (rev 5b) -------------------------------------------
+	// [Weather] Debug=yes|no is the master switch for per-event lines (load-time
+	// config echo and warnings about unknown names always print). Each category
+	// has its own Debug.<Category>=yes|no and every category shares a per-game
+	// line budget, Debug.Lines (0 = unlimited), so a long game can't flood
+	// debug.log. Logging never touches the synced RNG or game state.
+	enum class Cat { Meters, Contributors, Fire, Motion, Pools, Effects, Anims, Damage, Count };
+	struct DebugCat { const char* key; bool on; int left; };
+	DebugCat DebugCats[(int)Cat::Count] = {
+		{ "Debug.Meters", true, 0 }, { "Debug.Contributors", true, 0 },
+		{ "Debug.Fire", true, 0 }, { "Debug.Motion", true, 0 },
+		{ "Debug.Pools", true, 0 }, { "Debug.Effects", true, 0 },
+		{ "Debug.Anims", true, 0 }, { "Debug.Damage", true, 0 },
+	};
+	bool DebugMaster = true;
+	int DebugLines = 40;
+
+	// True if a line of this category may be written now; consumes budget.
+	bool Dbg(Cat c)
+	{
+		DebugCat& d = DebugCats[(int)c];
+		if (!DebugMaster || !d.on)
+			return false;
+		if (DebugLines <= 0)
+			return true;
+		if (d.left <= 0)
+			return false;
+		--d.left;
+		return true;
+	}
+
+	// Category enabled at all (periodic lines and follow-ups, no budget).
+	bool DbgOn(Cat c)
+	{
+		return DebugMaster && DebugCats[(int)c].on;
+	}
+
+	void ResetDebugBudgets()
+	{
+		for (auto& d : DebugCats)
+			d.left = DebugLines;
+	}
 
 	// ---- firing effect (P2) ----------------------------------------------
 	enum class TargetMode { Random, MapCenter };
@@ -254,7 +296,6 @@ namespace
 	bool finalized = false;
 
 	int logCounter = 0;
-	int detLinesLeft = DET_LINE_BUDGET;
 
 	// ---- small parsing helpers -------------------------------------------
 	bool ReadBoolKeepCurrent(CCINIClass* pINI, const char* section, const char* key, bool current)
@@ -686,8 +727,6 @@ namespace
 	}
 
 	// ---- firing (P2) ------------------------------------------------------
-	int fireLinesLeft = 40; // per-game individual fire-line budget
-	int versusLinesLeft = 20; // per-game damage-adjust log budget
 
 	HouseClass* ResolveFiringHouse(const std::string& owner)
 	{
@@ -780,7 +819,6 @@ namespace
 	}
 
 	// ---- meter motion (rev 4) ---------------------------------------------
-	int MotionLinesLeft = 40;
 
 	int StepTime(const Meter& m, int dir)
 	{
@@ -816,9 +854,8 @@ namespace
 		m.edgePending = false;
 		if (nd)
 			m.motionTimer = StepTime(m, nd);
-		if (MotionLinesLeft > 0)
+		if (Dbg(Cat::Motion))
 		{
-			--MotionLinesLeft;
 			Debug::Log("[WeatherExt] frame %d: '%s' motion set to %s by a contributor\n",
 				Unsorted::CurrentFrame, m.Name.c_str(), nd > 0 ? "climb" : nd < 0 ? "decline" : "stable");
 		}
@@ -862,9 +899,8 @@ namespace
 			case 3: m.dir = 0; what = "stop"; break;
 			default: break;
 			}
-			if (MotionLinesLeft > 0 && d.atEnd != 1)
+			if (d.atEnd != 1 && Dbg(Cat::Motion))
 			{
-				--MotionLinesLeft;
 				Debug::Log("[WeatherExt] frame %d: '%s' reached %d -> %s (now %s, amount %d)\n",
 					Unsorted::CurrentFrame, m.Name.c_str(), edge, what,
 					m.dir > 0 ? "climb" : m.dir < 0 ? "decline" : "stable", m.Amount);
@@ -1322,6 +1358,7 @@ namespace
 		HouseClass* owner;
 		CellStruct cell;
 		AnimClass* cloud;          // validated against AnimClass::Array before use
+		AnimTypeClass* cloudType;  // ...and its type, so a reused address isn't mistaken for it
 		int startFrame;
 		bool triggered;
 		int boltsLeft;
@@ -1329,7 +1366,6 @@ namespace
 	};
 	std::vector<PendingStrike> PendingStrikes;
 	constexpr size_t MAX_PENDING_STRIKES = 1000;
-	int EffectLinesLeft = 20;
 
 	void ReadEffectKeys(StrikeEffect& e)
 	{
@@ -1447,6 +1483,125 @@ namespace
 		return shp ? shp->Frames : 0;
 	}
 
+	const char* LayerName(Layer l)
+	{
+		switch (l)
+		{
+		case Layer::Underground: return "underground";
+		case Layer::Surface: return "surface";
+		case Layer::Ground: return "ground";
+		case Layer::Air: return "air";
+		case Layer::Top: return "top";
+		default: return "none";
+		}
+	}
+
+	const char* LandName(LandType l)
+	{
+		static const char* names[] = { "clear", "road", "water", "rock", "wall", "tiberium",
+			"beach", "rough", "ice", "railroad", "tunnel", "weeds" };
+		const int i = (int)l;
+		return (i >= 0 && i < 12) ? names[i] : "none";
+	}
+
+	// What the LOCAL player can see at a coord: screen position and
+	// shroud/fog. Logging only -- never feeds back into the simulation.
+	void ViewFacts(const CoordStruct& c, char* buf, size_t n)
+	{
+		bool onScreen = false;
+		Point2D pt{};
+		if (TacticalClass::Instance)
+		{
+			pt = TacticalClass::Instance->CoordsToClient(c).first;
+			const auto& vb = *reinterpret_cast<RectangleStruct*>(0xB0CE28); // tactical view size
+			onScreen = pt.X >= 0 && pt.Y >= 0 && pt.X <= vb.Width && pt.Y <= vb.Height;
+		}
+		CellClass* pCell = MapClass::Instance.TryGetCellAt(CellClass::Coord2Cell(c));
+		const bool shrouded = pCell && pCell->IsShrouded();
+		const bool fogged = pCell && pCell->IsFogged();
+		_snprintf_s(buf, n, _TRUNCATE, "screen=%s(%d,%d) shrouded=%s fogged=%s",
+			onScreen ? "on" : "off", pt.X, pt.Y, shrouded ? "yes" : "no", fogged ? "yes" : "no");
+	}
+
+	// Anim lifecycle watch (Debug.Anims): every anim an effect creates is
+	// logged at birth, one frame later, and at death.
+	struct AnimWatch
+	{
+		AnimClass* p;
+		AnimTypeClass* type;
+		const char* role;
+		int born;
+		int frames;
+		int lastStage;
+		bool checked;
+		int id;
+	};
+	std::vector<AnimWatch> AnimWatches;
+	int AnimWatchSeq = 0;
+	constexpr size_t MAX_ANIM_WATCH = 128;
+
+	bool AnimAliveAs(AnimClass* p, AnimTypeClass* type)
+	{
+		return AnimAlive(p) && p->Type == type;
+	}
+
+	AnimClass* MakeAnim(AnimTypeClass* t, const CoordStruct& c, DWORD flags,
+		const char* role, const StrikeEffect& e)
+	{
+		AnimClass* a = GameCreate<AnimClass>(t, c, 0, 1, flags, 0, false);
+		if (Dbg(Cat::Anims))
+		{
+			char view[128];
+			ViewFacts(c, view, sizeof(view));
+			const int id = ++AnimWatchSeq;
+			const bool alive = AnimAliveAs(a, t);
+			Debug::Log("[WeatherExt] frame %d: anim #%d %s '%s' (effect '%s') born at %d,%d,%d: "
+				"alive=%s frames=%d layer=%s invisible=%s %s\n", Unsorted::CurrentFrame, id, role,
+				t->ID, e.Name.c_str(), c.X, c.Y, c.Z, alive ? "yes" : "NO",
+				alive ? AnimFrames(a) : 0, LayerName(t->Layer),
+				(alive && a->Invisible) ? "YES" : "no", view);
+			if (alive && AnimWatches.size() < MAX_ANIM_WATCH)
+				AnimWatches.push_back({ a, t, role, Unsorted::CurrentFrame, AnimFrames(a),
+					a->Animation.Value, false, id });
+		}
+		return a;
+	}
+
+	void TickAnimWatch()
+	{
+		const int now = Unsorted::CurrentFrame;
+		size_t w = 0;
+		for (size_t r = 0; r < AnimWatches.size(); ++r)
+		{
+			AnimWatch aw = AnimWatches[r];
+			if (!AnimAliveAs(aw.p, aw.type))
+			{
+				if (DbgOn(Cat::Anims))
+					Debug::Log("[WeatherExt] frame %d: anim #%d %s '%s' ended after %d frames "
+						"(last stage %d of %d)\n", now, aw.id, aw.role, aw.type->ID,
+						now - aw.born, aw.lastStage, aw.frames);
+				continue;
+			}
+			if (!aw.checked && now > aw.born)
+			{
+				aw.checked = true;
+				if (DbgOn(Cat::Anims))
+				{
+					char view[128];
+					ViewFacts(aw.p->GetCoords(), view, sizeof(view));
+					Debug::Log("[WeatherExt] frame %d: anim #%d %s '%s' 1 frame on: stage %d of %d, "
+						"invisible=%s paused=%s inLimbo=%s onMap=%s %s\n", now, aw.id, aw.role,
+						aw.type->ID, aw.p->Animation.Value, aw.frames,
+						aw.p->Invisible ? "YES" : "no", aw.p->Paused ? "YES" : "no",
+						aw.p->InLimbo ? "YES" : "no", aw.p->IsOnMap ? "yes" : "NO", view);
+				}
+			}
+			aw.lastStage = aw.p->Animation.Value;
+			AnimWatches[w++] = aw;
+		}
+		AnimWatches.resize(w);
+	}
+
 	// The vanilla cloud height: (int)((boltImage.Height/2 - 0.5) * CloudHeightFactor)
 	// (0x53A15D / 0x6D2120), using the effect's first bolt image.
 	int CloudHeight(const StrikeEffect& e)
@@ -1469,6 +1624,7 @@ namespace
 		StrikeEffect& e = Effects[fx];
 		auto& rng = ScenarioClass::Instance->Random;
 		AnimClass* cloud = nullptr;
+		AnimTypeClass* cloudType = nullptr;
 		if (!e.clouds.empty())
 		{
 			if (CellClass* pCell = MapClass::Instance.TryGetCellAt(cell))
@@ -1476,11 +1632,18 @@ namespace
 				CoordStruct c = pCell->GetCoords();
 				c.Z = pCell->Level * Unsorted::LevelHeight + CloudHeight(e)
 					+ (pCell->ContainsBridge() ? CellClass::BridgeHeight : 0);
-				AnimTypeClass* t = e.clouds[rng.RandomRanged(0, (int)e.clouds.size() - 1)];
-				cloud = GameCreate<AnimClass>(t, c, 0, 1, 0x600, 0, false);
+				cloudType = e.clouds[rng.RandomRanged(0, (int)e.clouds.size() - 1)];
+				cloud = MakeAnim(cloudType, c, 0x600, "cloud", e);
 			}
 		}
-		PendingStrike ps{ fx, owner, cell, cloud, Unsorted::CurrentFrame, cloud == nullptr,
+		if (Dbg(Cat::Effects))
+			Debug::Log("[WeatherExt] frame %d: effect '%s' started at cell %d,%d for %s: cloud=%s "
+				"height=%d (CloudHeightFactor %.3f) bolts=%d, bolt at %s\n", Unsorted::CurrentFrame,
+				e.Name.c_str(), cell.X, cell.Y, owner ? owner->PlainName : "<none>",
+				cloudType ? cloudType->ID : "none", cloudType ? CloudHeight(e) : 0,
+				(double)LightningStorm::CloudHeightFactor, e.boltCount,
+				e.boltAt == -1 ? "half the cloud" : e.boltAt == -2 ? "the cloud's end" : "a set time");
+		PendingStrike ps{ fx, owner, cell, cloud, cloudType, Unsorted::CurrentFrame, cloud == nullptr,
 			e.boltCount, Unsorted::CurrentFrame };
 		PendingStrikes.push_back(ps);
 	}
@@ -1504,11 +1667,18 @@ namespace
 		const CoordStruct ground = pCell->GetCoords();
 		const CoordStruct impact = pCell->GetCoordsWithBridge();
 
+		AnimTypeClass* boltType = nullptr;
 		if (!e.bolts.empty())
-			GameCreate<AnimClass>(e.bolts[rng.RandomRanged(0, (int)e.bolts.size() - 1)],
-				ground, 0, 1, 0x600, 0, false);
+		{
+			boltType = e.bolts[rng.RandomRanged(0, (int)e.bolts.size() - 1)];
+			MakeAnim(boltType, ground, 0x600, "bolt", e);
+		}
+		int sound = -1;
 		if (!e.sounds.empty())
-			VocClass::PlayAt(e.sounds[rng.RandomRanged(0, (int)e.sounds.size() - 1)], ground);
+		{
+			sound = e.sounds[rng.RandomRanged(0, (int)e.sounds.size() - 1)];
+			VocClass::PlayAt(sound, ground);
+		}
 
 		RulesClass* R = RulesClass::Instance;
 		const int damage = e.damage != INT_MIN ? e.damage : (R ? R->LightningDamage : 0);
@@ -1521,7 +1691,7 @@ namespace
 		else if (!e.impactsSet && e.warhead)
 			impactType = MapClass::SelectDamageAnimation(damage, e.warhead, land, impact);
 		if (impactType)
-			GameCreate<AnimClass>(impactType, impact, 0, 1, 0x2600, 0, false);
+			MakeAnim(impactType, impact, 0x2600, "impact", e);
 
 		if (e.warhead)
 		{
@@ -1536,12 +1706,28 @@ namespace
 		const bool changed = hadContent != (pCell->GetContent() != nullptr);
 		const bool bare = !hadContent && (land == LandType::Road || land == LandType::Rock
 			|| land == LandType::Wall || land == LandType::Weeds);
+		int debrisMade = 0;
 		if (!e.debris.empty() && e.debrisMax > 0 && (bare || changed) && !pCell->ContainsBridge())
 		{
 			const int n = rng.RandomRanged(e.debrisMin, e.debrisMax);
 			for (int i = 0; i < n; ++i)
-				GameCreate<AnimClass>(e.debris[rng.RandomRanged(0, (int)e.debris.size() - 1)],
-					impact, 0, 1, 0x600, 0, false);
+				MakeAnim(e.debris[rng.RandomRanged(0, (int)e.debris.size() - 1)],
+					impact, 0x600, "debris", e);
+			debrisMade = n;
+		}
+
+		if (Dbg(Cat::Effects))
+		{
+			char view[128];
+			ViewFacts(ground, view, sizeof(view));
+			Debug::Log("[WeatherExt] frame %d: effect '%s' bolt %d of %d at cell %d,%d (target %d,%d) "
+				"land=%s ground z=%d: bolt=%s sound=%d impact=%s warhead=%s damage=%d flash=%s "
+				"debris=%d (content %s->%s) %s\n", Unsorted::CurrentFrame, e.Name.c_str(),
+				e.boltCount - ps.boltsLeft + 1, e.boltCount, cell.X, cell.Y, ps.cell.X, ps.cell.Y,
+				LandName(land), ground.Z, boltType ? boltType->ID : "none", sound,
+				impactType ? impactType->ID : "none", e.warhead ? e.warhead->ID : "none", damage,
+				e.flash ? "yes" : "no", debrisMade, hadContent ? "yes" : "no",
+				pCell->GetContent() ? "yes" : "no", view);
 		}
 	}
 
@@ -1558,13 +1744,23 @@ namespace
 				bool fire = false;
 				if (e.boltAt >= 0)
 					fire = now - ps.startFrame >= e.boltAt;
-				else if (!AnimAlive(ps.cloud))
+				else if (!AnimAliveAs(ps.cloud, ps.cloudType))
+				{
 					fire = true; // cloud gone (or never made): strike now
+					if (ps.cloud && Dbg(Cat::Effects))
+						Debug::Log("[WeatherExt] frame %d: effect '%s' at cell %d,%d: cloud ended "
+							"before its trigger stage -> bolting now\n", now, e.Name.c_str(),
+							ps.cell.X, ps.cell.Y);
+				}
 				else
 				{
 					const int frames = AnimFrames(ps.cloud);
 					const int at = ps.cloud->Animation.Value;
 					fire = e.boltAt == -1 ? (frames / 2 < at) : (frames - 1 <= at);
+					if (fire && Dbg(Cat::Effects))
+						Debug::Log("[WeatherExt] frame %d: effect '%s' at cell %d,%d: cloud '%s' at "
+							"stage %d of %d -> bolting\n", now, e.Name.c_str(), ps.cell.X, ps.cell.Y,
+							ps.cloudType->ID, at, frames);
 				}
 				if (fire)
 				{
@@ -1584,9 +1780,8 @@ namespace
 				}
 				if (ps.boltsLeft <= 0)
 				{
-					if (EffectLinesLeft > 0)
+					if (Dbg(Cat::Effects))
 					{
-						--EffectLinesLeft;
 						Debug::Log("[WeatherExt] frame %d: effect '%s' struck cell %d,%d "
 							"(%d frames after its cloud)\n", now, e.Name.c_str(),
 							ps.cell.X, ps.cell.Y, now - ps.startFrame);
@@ -1743,9 +1938,8 @@ namespace
 			++shotsNow;
 			++pool.shots;
 			last = i;
-			if (fireLinesLeft > 0)
+			if (Dbg(Cat::Pools))
 			{
-				--fireLinesLeft;
 				Debug::Log("[WeatherExt] frame %d: pool '%s' weight=%d slot %d/%d fired x%d "
 					"(%s, next in %df) last target cell %d,%d\n", Unsorted::CurrentFrame,
 					pool.Name.c_str(), w, i + 1, n, launched, PatternName(pat), pool.timers[i],
@@ -1905,6 +2099,10 @@ void Weather::ReadGlobals(CCINIClass* pINI)
 
 	c.Enabled = ReadBoolKeepCurrent(pINI, CFG_SECTION, "Enabled", c.Enabled);
 	c.LogInterval = pINI->ReadInteger(CFG_SECTION, "LogInterval", c.LogInterval);
+	DebugMaster = ReadBoolKeepCurrent(pINI, CFG_SECTION, "Debug", DebugMaster);
+	DebugLines = pINI->ReadInteger(CFG_SECTION, "Debug.Lines", DebugLines);
+	for (auto& d : DebugCats)
+		d.on = ReadBoolKeepCurrent(pINI, CFG_SECTION, d.key, d.on);
 	c.WeatherScale = pINI->ReadDouble(CFG_SECTION, "WeatherScale", c.WeatherScale);
 
 	// Rebuild the meter registry from [WeatherSystems] (0=,1=,...). Present-only:
@@ -2108,13 +2306,11 @@ void Weather::ReadGlobals(CCINIClass* pINI)
 		}
 	}
 	PendingStrikes.clear();
-	EffectLinesLeft = 20;
-	MotionLinesLeft = 40;
+	AnimWatches.clear();
+	AnimWatchSeq = 0;
 
 	logCounter = 0;
-	detLinesLeft = DET_LINE_BUDGET;
-	fireLinesLeft = 40;
-	versusLinesLeft = 20;
+	ResetDebugBudgets();
 	pendingFinish.clear(); // new game / re-parse: drop any scheduled pulses
 	finalized = false; // force re-resolve of contributors against the new registry
 
@@ -2123,6 +2319,15 @@ void Weather::ReadGlobals(CCINIClass* pINI)
 		Debug::Log("[WeatherExt] globals: Enabled=%s LogInterval=%d WeatherScale=%.3f "
 			"meters=%zu\n", c.Enabled ? "yes" : "no", c.LogInterval, c.WeatherScale,
 			Meters.size());
+		{
+			std::string cats;
+			for (auto& d : DebugCats)
+				if (!d.on)
+					cats += std::string(" ") + (d.key + 6) + "=no";
+			Debug::Log("[WeatherExt]   debug: %s, %d lines per category%s%s\n",
+				DebugMaster ? "on" : "OFF (per-event lines silenced)",
+				DebugLines, DebugLines <= 0 ? " (unlimited)" : "", cats.c_str());
+		}
 		for (auto& m : Meters)
 			Debug::Log("[WeatherExt]   meter '%s': start=%d range=[%d,%d] "
 				"baseline=%d decay=%d/%df fireSlots=%zu owner=%s motion=%d "
@@ -2268,9 +2473,8 @@ void Weather::OnDetonation(WarheadTypeClass* pWH, TechnoClass* pSource, HouseCla
 		const int before = m.Amount;
 		m.Amount = ClampMeter(m, m.Amount + delta);
 
-		if (detLinesLeft > 0 && before != m.Amount)
+		if (before != m.Amount && Dbg(Cat::Contributors))
 		{
-			--detLinesLeft;
 			auto pOwner = pHouse ? pHouse : (pSource ? pSource->Owner : nullptr);
 			Debug::Log("[WeatherExt] frame %d: %s -> '%s' %+d (house %s): %d -> %d\n",
 				Unsorted::CurrentFrame, pWH->ID, m.Name.c_str(), delta,
@@ -2325,9 +2529,8 @@ void Weather::OnSuperWeaponFired(HouseClass* pHouse, int swSlotIndex)
 		}
 	}
 
-	if (fireLinesLeft > 0)
+	if (Dbg(Cat::Contributors))
 	{
-		--fireLinesLeft;
 		Debug::Log("[WeatherExt] frame %d: SW %s fired by %s -> contributed "
 			"(interval %d)\n", Unsorted::CurrentFrame, pSuper->Type->ID,
 			pHouse->PlainName, sc.interval);
@@ -2367,9 +2570,8 @@ int Weather::AdjustDamage(int damage, WarheadTypeClass* pWH, int armor)
 	if (factor == 1.0)
 		return damage;
 	const int adjusted = static_cast<int>(std::lround(damage * factor));
-	if (versusLinesLeft > 0)
+	if (Dbg(Cat::Damage))
 	{
-		--versusLinesLeft;
 		Debug::Log("[WeatherExt] frame %d: %s vs armor %d damage %d -> %d (x%.2f)\n",
 			Unsorted::CurrentFrame, pWH->ID, armor, damage, adjusted, factor);
 	}
@@ -2502,9 +2704,8 @@ void Weather::FrameTick()
 			s.timer = interval;
 			++s.fired;
 
-			if (fireLinesLeft > 0)
+			if (Dbg(Cat::Fire))
 			{
-				--fireLinesLeft;
 				Debug::Log("[WeatherExt] frame %d: '%s'=%d fired %s x%d "
 					"(owner %s, next in %df)\n", Unsorted::CurrentFrame,
 					m.Name.c_str(), m.Amount, s.swName.c_str(), launched,
@@ -2521,6 +2722,8 @@ void Weather::FrameTick()
 	// --- strike effects in flight (clouds waiting to bolt) ---
 	if (!PendingStrikes.empty())
 		TickEffects();
+	if (!AnimWatches.empty())
+		TickAnimWatch();
 
 	// --- Effect: global cost multiplier (house-field approach) ---
 	// Re-drive each house's own cost recompute (HouseClass::CalculateCostMultipliers,
@@ -2550,7 +2753,7 @@ void Weather::FrameTick()
 	}
 
 	// --- periodic logging ---
-	if (Config.LogInterval > 0 && ++logCounter >= Config.LogInterval)
+	if (Config.LogInterval > 0 && ++logCounter >= Config.LogInterval && DbgOn(Cat::Meters))
 	{
 		logCounter = 0;
 		for (auto& m : Meters)
@@ -2561,6 +2764,9 @@ void Weather::FrameTick()
 			Debug::Log("[WeatherExt] frame %d: pool '%s' weight=%d band=%d slots=%zu shots=%d\n",
 				Unsorted::CurrentFrame, p.Name.c_str(), p.weight, p.band,
 				p.timers.size(), p.shots);
+		if (!Effects.empty())
+			Debug::Log("[WeatherExt] frame %d: effects in flight=%zu, anims watched=%zu\n",
+				Unsorted::CurrentFrame, PendingStrikes.size(), AnimWatches.size());
 	}
 }
 
