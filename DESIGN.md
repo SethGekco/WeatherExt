@@ -746,3 +746,234 @@ maps to exactly the column the game uses. Each `Row.<kf>` is parallel to the
 it's expanded to the full positional row the damage hook indexes. Unknown names
 log a warning and skip that column. Omit `Armors=` and a `Row` is still a full
 positional row (Verses order), so old configs are unaffected.
+
+---
+
+# Design rev 4 — storm motion + strike pools (replaces `weatherStorm.ini`)
+
+## What `weatherStorm.ini` actually does (read 2026-11-09)
+
+The 1.5 MB, 67,491-line file is **one level counter and one strike SW**, spelled
+out as 2,543 sections:
+
+| Family | Count | What it is |
+|---|---|---|
+| `WeatherStormStep001-500` | 500 limbo buildings | The **level**: N buildings present = level N. Each grants one strike SW + one climb SW. |
+| `WeatherStrikeSW001-500` | 500 SWs | 500 identical copies of one strike (`MultiMissile`, payload `WeatherStrikePayload`, `STRMTWRWH`, `RechargeTime=10`, `InitialReady=yes`, `AutoFire`). Level N = N independent strike timers. |
+| `DeliverySW001-500` | 500 SWs | **Climb**: SW *k* (gated by `DeliveryDummy`) limbo-delivers step *k*+1 and kills `DecimationStep`*k*. Its `RechargeTime` is the climb rate. |
+| `DecimationStep001-500` | 500 limbo buildings | The decline ladder, one `DecimationSW` each. |
+| `DecimationSW001-500` | 500 SWs | **Decline**: SW *k* (gated by `DecimationDummy`) delivers the next decimation step and kills a `WeatherStormStep`. Its `RechargeTime` is the decline rate. |
+| `DeliveryFiller(SW)`, `DecimationSW500`, the two `*Dummy`s | 5 | The **turn-around**: at the top, flip the gate dummies to decline; at the bottom, flip back to climb. |
+| `SKIRMISHNINJA03V` + `SNINJASTARTSW` + `SWSPWNTYP01-34` | 36 | The spawner that drops the starting level's buildings (one delivery list per SW). |
+| `StartDeliverySW`, `StartDecimationSW`, `DecimationJumpStartSW` | 3 | Start direction; `StartStable.ini` disables both = no motion. |
+
+The CnCNet Game Options files then rewrite this ladder per dial position:
+`StartingLevel*`/`MaxLevel*`/`LowestLevel*` (500 each — they re-point
+`LimboDelivery`/`LimboKill` lists and disable SWs past the edge),
+`DeliverySW_Recharge*`/`DecimationSW_Recharge*`/`WeatherStrikeSW_Recharge*`
+(75 each), `InitialDelay*` (75). Observed limits of the old method:
+
+- The recharge dials only cover **levels 1-100** (each file has 100 sections),
+  so levels 101-500 always run the default rates.
+- Every strike copy recharges at the **same** rate; there is no way to make the
+  storm get *faster* as it grows, only *denser*.
+- `SNINJASTARTSW` is `SW.AlwaysGranted=yes`, `SW.AllowAI=no`: as I read it, **each
+  human player runs their own copy of the ladder**, so a 2-human match gets two
+  storms. (Flagged for Rex to confirm; WeatherExt can reproduce it on purpose
+  with `Strike.Owner=each-human`, or run one shared storm with `neutral`.)
+
+Under WeatherExt the whole file becomes **one meter + one pool + one strike SW**.
+
+## Units — every time key in WeatherExt
+
+A bare number is **frames** (unchanged, so every rev 1-3 config still means the
+same). A suffix converts: `s` = seconds (15 frames), `m` = minutes (900 frames,
+the same scale as the engine's `RechargeTime`), `f` = frames. Decimals are fine:
+`0.25m`, `1.5s`. Resolution is one game frame (finer than 0.01 minute). This now
+applies to *every* time key: `DecayRate`, `Fire.Intervals`, `Fire.IntervalStep`,
+`Fire.IntervalMin`, `WeatherSystem.Rate`, `WeatherSystem.Interval`, and all the
+new keys below.
+
+## Part A — meter motion (the climb/decline ladder)
+
+New keys on any meter in `[WeatherSystems]`. Motion is separate from `Decay`
+(which still pulls toward `Baseline`); use one or the other, or both.
+
+```ini
+[WeatherStorm]
+StartAmount=100        ; where the storm starts          (StartingLevel*)
+Min=0                  ; hard clamps -- nothing goes outside these
+Max=5000
+
+Motion=climb           ; climb | decline | stable | random   start direction
+Motion.Delay=1m        ; no motion before this           (InitialDelay*)
+
+Climb.Step=10          ; Amount added per climb step
+Climb.Every=23s        ; time per climb step             (DeliverySW_Recharge*)
+Climb.Spread=0,0       ; random extra time per step, lo,hi
+Climb.To=5000          ; the top edge (default Max)      (MaxLevel*)
+Climb.AtEnd=reverse    ; reverse | hold | wrap | stop
+Climb.Pause=0          ; wait at the top edge before AtEnd acts
+
+Decline.Step=10
+Decline.Every=55s      ;                                 (DecimationSW_Recharge*)
+Decline.Spread=0,0
+Decline.To=0           ; the bottom edge (default Min)   (LowestLevel*)
+Decline.AtEnd=reverse
+Decline.Pause=0
+```
+
+`AtEnd` actions: **reverse** = turn around (the old ladder); **hold** = sit at
+the edge and keep the direction, so if contributors push it back it resumes;
+**wrap** = jump to the other edge and keep going (sawtooth); **stop** = become
+`stable`. `Climb.To`/`Decline.To` are the *turn-around* edges and are separate
+from `Min`/`Max`: contributors can still push the meter past `Climb.To` up to
+`Max`, and the motion then works its way back.
+
+**Steering motion from events.** Any contributor (warhead, SW, techno) may add
+`WeatherSystem.Motion=` parallel to `WeatherSystem.Types`, one of
+`climb | decline | stable | reverse | keep` (default `keep`). A "Weather Control
+Device" SW can now push the storm into decline; a nuke can kick it into climb.
+
+## Part B — strike pools (the 500 strike copies)
+
+New registry `[WeatherStrikes]` (`0=`, `1=`, ...). Each entry is a pool section.
+A pool reads a **Weight** from one or more meters, turns Weight into **slots**
+(one slot = one old `WeatherStormStep` + its `WeatherStrikeSW` copy), and gives
+every slot its own recharge timer. The pool fires one real SW type; the SW's own
+`RechargeTime` is ignored.
+
+```ini
+[WeatherStrikes]
+0=StormStrikes
+
+[StormStrikes]
+; --- Weight: what this pool reads ---
+Weight.Systems=WeatherStorm     ; meters summed into Weight
+Weight.Factors=1.0              ; per meter (default 1.0; negative allowed)
+
+; --- Slots: how many strikes exist ---
+Slots.PerWeight=10              ; one slot per 10 Weight (Weight 250 -> 25 slots)
+Slots.Min=0                     ; floor once the pool is live
+Slots.Max=500                   ; ceiling
+Slots.Delay=0                   ; nothing fires before this game time
+Slots.NewReady=yes              ; a new slot fires at once (old InitialReady=yes)
+Slots.Remove=newest             ; newest | oldest -- which slot goes when Weight drops
+
+; --- Recharge: how fast each slot reloads ---
+Recharge.Max=10m                ; slowest (the unshaved recharge) (WeatherStrikeSW_Recharge*)
+Recharge.Min=1m                 ; fastest any slot can get
+Recharge.Shave=0.5s,1           ; take 0.5s off per 1 Weight  (time,per-Weight)
+Recharge.ShaveFrom=0            ; Weight where shaving starts
+Recharge.Spread=0,1s            ; random extra per reload, lo,hi
+Recharge.Pattern=climb          ; global | even | climb | decline  (a list = a cycle)
+Recharge.Pattern.Switch=never   ; never | every | random | motion | saturated
+Recharge.Pattern.Every=5m       ; for every / random
+Recharge.Live=no                ; yes = running timers rescale when the target changes
+
+; --- Volley: what one shot is ---
+Strike.SW=WeatherStrikeSW       ; one SW, or a list picked per shot by...
+Strike.SW.Chances=              ; ...these weights (default equal)
+Strike.Count=1                  ; SWs per shot
+Strike.Count.Add=1,1000         ; +1 SW per shot per 1000 Weight (count,per-Weight)
+Strike.Count.Max=3
+Strike.Gap=0                    ; min time between ANY two shots of this pool
+Strike.PerFrame=2               ; hard cap on shots per frame (the lag guard)
+Strike.Target=random            ; random | mapcenter
+Strike.Owner=neutral            ; neutral | random | <country> | each-human | each-player
+Strike.Grant=yes                ; grant the SW to the firing house(s) first
+```
+
+### Recharge patterns
+
+The pool computes one **shave budget** from Weight, then shares it out. With
+`Recharge.Shave=t,p`: budget = `t x (Weight - ShaveFrom) / p` (never below 0).
+Each slot's range is `Max - Min`; slot 1 is the oldest.
+
+| Pattern | Who gets the budget | Feel |
+|---|---|---|
+| `global` | **every** slot gets the full budget | the whole storm speeds up together |
+| `even` | the budget is **split** across slots | growth adds bolts, not speed |
+| `climb` | slot 1 until it hits `Min`, then slot 2, ... | a few strikes get frantic first, then it spreads |
+| `decline` | the newest slot first, then backwards | the fresh edge of the storm is the violent part |
+
+Switching (`Recharge.Pattern` with a list):
+**every** = advance to the next pattern each `Pattern.Every`; **random** = synced
+random pick each `Pattern.Every`; **motion** = pattern 1 while the first
+`Weight.Systems` meter climbs, pattern 2 while it declines, pattern 3 (or 1)
+while stable; **saturated** = advance when the current pattern has pushed every
+slot to `Min`.
+
+`Recharge.Spread` is re-rolled each time a slot reloads, from the synced game
+RNG, so every client gets the same storm.
+
+### Weight bands — any pool key can change with Weight
+
+Append a Weight to any pool key and it takes over from that Weight up:
+
+```ini
+Strike.SW=WeatherStrikeSW
+Strike.SW.3000=HeavyStrikeSW            ; Weight >= 3000: the heavy cloud
+Strike.SW.Chances.3000=                 ; (band suffix is always the LAST part)
+Recharge.Pattern=climb
+Recharge.Pattern.2000=global            ; past 2000 the whole storm accelerates
+Slots.PerWeight.4000=5                  ; past 4000 slots come twice as fast
+```
+
+The highest band at or below the current Weight wins, key by key; a key with no
+band uses its plain value. Bands are read once at load and stored as a sorted
+list of complete parameter sets, so picking one per frame is a short scan.
+
+**Several lists, several weights**: give a pool more than one meter
+(`Weight.Systems=A,B` with `Weight.Factors=1.0,0.5`), and/or declare several
+pools on the same meter (a light-cloud pool and a heavy-cloud pool with
+different bands and patterns). Each pool is fully independent.
+
+## Lobby (CnCNet) — what replaces the 1,800 storm files
+
+Every key is read **present-only on every INI pass**, so a Game Options file
+that the client merges only needs the keys it changes:
+
+```ini
+; INI/Game Options/StormStart_Severe.ini  -- replaces StartingLevel250.ini
+[WeatherStorm]
+StartAmount=2500
+```
+
+| Old family | Files | New key |
+|---|---|---|
+| `StartingLevel*` | 500 | `WeatherStorm.StartAmount` |
+| `MaxLevel*` | 500 | `WeatherStorm.Climb.To` |
+| `LowestLevel*` | 500 | `WeatherStorm.Decline.To` |
+| `DeliverySW_Recharge*` | 75 | `WeatherStorm.Climb.Every` |
+| `DecimationSW_Recharge*` | 75 | `WeatherStorm.Decline.Every` |
+| `WeatherStrikeSW_Recharge*` | 75 | `StormStrikes.Recharge.Max` (and `.Min`) |
+| `InitialDelay*` | 75 | `WeatherStorm.Motion.Delay` |
+| `StartStable.ini` | 1 | `WeatherStorm.Motion=stable` |
+| (start in decline) | — | `WeatherStorm.Motion=decline` |
+| `StormDamage*` | 33 | rev 3 `Versus.*` rows |
+
+A dropdown needs one 2-line file per *choice it offers*, not per level, and once
+the P5 spawn.ini layer lands, zero files. The gradual-lightning families
+(`LightningMax/Min`, `WeatherStrikeDelay`, `gradualLightningspace`,
+`lightningstorms`) drive the separate `SKIRMRULESSPAWN3*` storm in rulesmd; they
+map onto a second pool the same way (`Slots.Max`, `Slots.Min`, `Slots.Delay`,
+`Strike.Gap`) once that system is read.
+
+## Runtime rules
+
+- Order per frame: pending pulses -> decay -> **motion** -> passive contributors
+  -> `Fire.*` slots -> **pools** -> cost. Meters and pools in registry order,
+  slots in index order, a rotating start slot so `Strike.PerFrame` never starves
+  the same slots.
+- All randomness (`random` motion, spreads, `Strike.SW.Chances`, targets,
+  `random` owner/pattern) comes from `ScenarioClass::Random`.
+- Times are stored as frames x 100 internally so `0.1s`-per-Weight shaves
+  accumulate exactly; each slot's timer rounds to whole frames.
+- Not yet saved in savegames (same gap as meters; tracked under persistence).
+
+## Phase P6
+
+P6a: time units, meter motion, `WeatherSystem.Motion`. P6b: strike pools with
+patterns, spread, counts, bands, owners, lag guards. Example config:
+`docs/examples/weatherstorm-remake.ini`.
