@@ -16,6 +16,12 @@
 #include <SuperWeaponTypeClass.h>
 #include <ScenarioClass.h>
 #include <MapClass.h>
+#include <CellClass.h>
+#include <AnimClass.h>
+#include <AnimTypeClass.h>
+#include <RulesClass.h>
+#include <VocClass.h>
+#include <Memory.h>
 #include <Fundamentals.h>
 #include <GeneralDefinitions.h>
 
@@ -925,6 +931,9 @@ namespace
 		std::vector<std::string> swNames;
 		std::vector<int> swIdx;
 		std::vector<int> chances;
+		std::vector<std::string> fxNames;   // Strike.Effect (rev 5)
+		std::vector<int> fxIdx;
+		std::vector<int> fxChances;
 		int count = 1;
 		int countAdd = 0, countAddPer = 1;
 		int countMax = 0;                   // 0 => no cap (hard ceiling 100)
@@ -1069,15 +1078,30 @@ namespace
 		if ((v = get("Strike.SW")))
 		{
 			p.swNames.clear();
-			for (auto& n : SplitList(*v))
-				if (!n.empty())
-					p.swNames.push_back(n);
+			if (_strcmpi(v->c_str(), "none") != 0)
+				for (auto& n : SplitList(*v))
+					if (!n.empty())
+						p.swNames.push_back(n);
 		}
 		if ((v = get("Strike.SW.Chances")))
 		{
 			p.chances.clear();
 			for (auto& n : SplitList(*v))
 				p.chances.push_back(std::max(0, atoi(n.c_str())));
+		}
+		if ((v = get("Strike.Effect")))
+		{
+			p.fxNames.clear();
+			if (_strcmpi(v->c_str(), "none") != 0)
+				for (auto& n : SplitList(*v))
+					if (!n.empty())
+						p.fxNames.push_back(n);
+		}
+		if ((v = get("Strike.Effect.Chances")))
+		{
+			p.fxChances.clear();
+			for (auto& n : SplitList(*v))
+				p.fxChances.push_back(std::max(0, atoi(n.c_str())));
 		}
 		if ((v = get("Strike.Count"))) p.count = std::max(0, atoi(v->c_str()));
 		if ((v = get("Strike.Count.Add")))
@@ -1256,29 +1280,350 @@ namespace
 		return P.patterns[pool.patternPos % np];
 	}
 
-	int PickPoolSW(const PoolParams& P)
+	// ---- strike effects (rev 5): the vanilla weather-control strike, staged ----
+	// Mirrors gamemd's own sequence (LightningStorm::Strike 0x53A140 ->
+	// Update 0x53A6C0 -> Strike2 0x53A300): a cloud forms above the cell; once
+	// it passes HALF its frames, a bolt anim plays at the ground with a sound,
+	// the impact anim and flash, DamageArea, and debris on bare ground.
+	// Implemented here rather than calling the engine because Antares replaces
+	// all three functions with versions bound to the active storm SW.
+	// Every stage defaults to the [General] value, so an empty section IS the
+	// vanilla strike; every stage can be swapped or turned off ("none").
+	struct StrikeEffect
 	{
-		const int n = (int)P.swIdx.size();
+		std::string Name;
+		RawMap raw;
+
+		// names (resolved in Finalize); "use default" = not set
+		bool cloudsSet = false, boltsSet = false, impactsSet = false;
+		bool soundsSet = false, debrisSet = false, warheadSet = false;
+		std::vector<std::string> cloudNames, boltNames, impactNames, soundNames, debrisNames;
+		std::string warheadName;
+		int cloudHeight = -1;      // leptons above ground; -1 = vanilla formula
+		int boltAt = -1;           // -1 = half the cloud's frames, -2 = cloud end, else frames
+		int boltCount = 1;
+		int boltEvery = 0;         // frames between bolts of one cloud
+		int boltSpread = 0;        // cells
+		int damage = INT_MIN;      // INT_MIN = [General] LightningDamage
+		int debrisMin = 2, debrisMax = 4;
+		bool flash = true;
+
+		// resolved
+		std::vector<AnimTypeClass*> clouds, bolts, impacts, debris;
+		std::vector<int> sounds;
+		WarheadTypeClass* warhead = nullptr;
+	};
+	std::vector<StrikeEffect> Effects;
+	std::unordered_map<std::string, int> EffectIndex;
+
+	struct PendingStrike
+	{
+		int fx;
+		HouseClass* owner;
+		CellStruct cell;
+		AnimClass* cloud;          // validated against AnimClass::Array before use
+		int startFrame;
+		bool triggered;
+		int boltsLeft;
+		int nextBoltFrame;
+	};
+	std::vector<PendingStrike> PendingStrikes;
+	constexpr size_t MAX_PENDING_STRIKES = 1000;
+	int EffectLinesLeft = 20;
+
+	void ReadEffectKeys(StrikeEffect& e)
+	{
+		auto get = [&](const char* k) -> const std::string* {
+			auto it = e.raw.find(Lower(k));
+			return it != e.raw.end() ? &it->second : nullptr;
+		};
+		auto names = [&](const char* k, bool& set, std::vector<std::string>& out) {
+			if (auto v = get(k))
+			{
+				set = true;
+				out.clear();
+				if (_strcmpi(v->c_str(), "none") != 0)
+					for (auto& n : SplitList(*v))
+						if (!n.empty())
+							out.push_back(n);
+			}
+		};
+		names("Cloud.Anims", e.cloudsSet, e.cloudNames);
+		names("Bolt.Anims", e.boltsSet, e.boltNames);
+		names("Bolt.Sounds", e.soundsSet, e.soundNames);
+		names("Impact.Anims", e.impactsSet, e.impactNames);
+		names("Impact.Debris", e.debrisSet, e.debrisNames);
+		const std::string* v;
+		if ((v = get("Cloud.Height")))
+			e.cloudHeight = _strcmpi(v->c_str(), "auto") == 0 ? -1 : std::max(0, atoi(v->c_str()));
+		if ((v = get("Bolt.At")))
+		{
+			if (_strcmpi(v->c_str(), "half") == 0) e.boltAt = -1;
+			else if (_strcmpi(v->c_str(), "end") == 0) e.boltAt = -2;
+			else e.boltAt = std::max(0, ParseTimeFrames(v->c_str()));
+		}
+		if ((v = get("Bolt.Count"))) e.boltCount = std::clamp(atoi(v->c_str()), 0, 100);
+		if ((v = get("Bolt.Every"))) e.boltEvery = std::max(0, ParseTimeFrames(v->c_str()));
+		if ((v = get("Bolt.Spread"))) e.boltSpread = std::clamp(atoi(v->c_str()), 0, 50);
+		if ((v = get("Impact.Damage"))) e.damage = atoi(v->c_str());
+		if ((v = get("Impact.Warhead"))) { e.warheadSet = true; e.warheadName = *v; }
+		if ((v = get("Impact.Flash"))) e.flash = ParseBool(*v, e.flash);
+		if ((v = get("Impact.Debris.Count")))
+		{
+			auto parts = SplitList(*v);
+			e.debrisMin = std::max(0, atoi(parts[0].c_str()));
+			e.debrisMax = parts.size() > 1 ? std::max(e.debrisMin, atoi(parts[1].c_str())) : e.debrisMin;
+		}
+	}
+
+	void ResolveEffect(StrikeEffect& e)
+	{
+		auto anims = [&](bool set, const std::vector<std::string>& names,
+			const TypeList<AnimTypeClass*>* fallback, std::vector<AnimTypeClass*>& out, const char* what) {
+			out.clear();
+			if (!set)
+			{
+				if (fallback)
+					for (int i = 0; i < fallback->Count; ++i)
+						if (fallback->Items[i])
+							out.push_back(fallback->Items[i]);
+				return;
+			}
+			for (auto& n : names)
+			{
+				if (auto p = AnimTypeClass::Find(n.c_str()))
+					out.push_back(p);
+				else
+					Debug::Log("[WeatherExt] effect '%s' %s: unknown anim '%s'; skipped.\n",
+						e.Name.c_str(), what, n.c_str());
+			}
+		};
+		RulesClass* R = RulesClass::Instance;
+		anims(e.cloudsSet, e.cloudNames, R ? &R->WeatherConClouds : nullptr, e.clouds, "Cloud.Anims");
+		anims(e.boltsSet, e.boltNames, R ? &R->WeatherConBolts : nullptr, e.bolts, "Bolt.Anims");
+		anims(e.debrisSet, e.debrisNames, R ? &R->MetallicDebris : nullptr, e.debris, "Impact.Debris");
+		// impacts: unset => engine's own pick (SelectDamageAnimation) at strike time
+		anims(e.impactsSet, e.impactNames, nullptr, e.impacts, "Impact.Anims");
+
+		e.sounds.clear();
+		if (!e.soundsSet)
+		{
+			if (R)
+				for (int i = 0; i < R->LightningSounds.Count; ++i)
+					e.sounds.push_back(R->LightningSounds.Items[i]);
+		}
+		else
+			for (auto& n : e.soundNames)
+			{
+				const int idx = VocClass::FindIndex(n.c_str());
+				if (idx >= 0)
+					e.sounds.push_back(idx);
+				else
+					Debug::Log("[WeatherExt] effect '%s' Bolt.Sounds: unknown sound '%s'; skipped.\n",
+						e.Name.c_str(), n.c_str());
+			}
+
+		e.warhead = e.warheadSet ? WarheadTypeClass::Find(e.warheadName.c_str())
+			: (R ? R->LightningWarhead : nullptr);
+		if (e.warheadSet && !e.warhead)
+			Debug::Log("[WeatherExt] effect '%s' Impact.Warhead: unknown warhead '%s'; "
+				"no damage.\n", e.Name.c_str(), e.warheadName.c_str());
+	}
+
+	bool AnimAlive(AnimClass* p)
+	{
+		if (!p)
+			return false;
+		auto& arr = AnimClass::Array;
+		for (int i = 0; i < arr.Count; ++i)
+			if (arr.Items[i] == p)
+				return !p->TimeToDie;
+		return false;
+	}
+
+	int AnimFrames(AnimClass* p)
+	{
+		SHPStruct* shp = (p && p->Type) ? p->Type->GetImage() : nullptr;
+		return shp ? shp->Frames : 0;
+	}
+
+	// The vanilla cloud height: (int)((boltImage.Height/2 - 0.5) * CloudHeightFactor)
+	// (0x53A15D / 0x6D2120), using the effect's first bolt image.
+	int CloudHeight(const StrikeEffect& e)
+	{
+		if (e.cloudHeight >= 0)
+			return e.cloudHeight;
+		SHPStruct* shp = e.bolts.empty() ? nullptr : e.bolts.front()->GetImage();
+		if (!shp)
+			return 0;
+		double factor = LightningStorm::CloudHeightFactor;
+		if (factor <= 0.0)
+			factor = 104.0 / 15.0; // leptons per pixel of height (LevelHeight / 15 px)
+		return static_cast<int>((shp->Height / 2 - 0.5) * factor);
+	}
+
+	void StartEffect(int fx, HouseClass* owner, CellStruct cell)
+	{
+		if (fx < 0 || PendingStrikes.size() >= MAX_PENDING_STRIKES)
+			return;
+		StrikeEffect& e = Effects[fx];
+		auto& rng = ScenarioClass::Instance->Random;
+		AnimClass* cloud = nullptr;
+		if (!e.clouds.empty())
+		{
+			if (CellClass* pCell = MapClass::Instance.TryGetCellAt(cell))
+			{
+				CoordStruct c = pCell->GetCoords();
+				c.Z = pCell->Level * Unsorted::LevelHeight + CloudHeight(e)
+					+ (pCell->ContainsBridge() ? CellClass::BridgeHeight : 0);
+				AnimTypeClass* t = e.clouds[rng.RandomRanged(0, (int)e.clouds.size() - 1)];
+				cloud = GameCreate<AnimClass>(t, c, 0, 1, 0x600, 0, false);
+			}
+		}
+		PendingStrike ps{ fx, owner, cell, cloud, Unsorted::CurrentFrame, cloud == nullptr,
+			e.boltCount, Unsorted::CurrentFrame };
+		PendingStrikes.push_back(ps);
+	}
+
+	// One bolt: the body of vanilla Strike2 with each piece configurable.
+	void DoBolt(const StrikeEffect& e, const PendingStrike& ps)
+	{
+		auto& rng = ScenarioClass::Instance->Random;
+		CellStruct cell = ps.cell;
+		if (e.boltSpread > 0)
+		{
+			CellStruct c2 = cell;
+			c2.X += static_cast<short>(rng.RandomRanged(-e.boltSpread, e.boltSpread));
+			c2.Y += static_cast<short>(rng.RandomRanged(-e.boltSpread, e.boltSpread));
+			if (MapClass::Instance.IsWithinUsableArea(c2, true))
+				cell = c2;
+		}
+		CellClass* pCell = MapClass::Instance.TryGetCellAt(cell);
+		if (!pCell)
+			return;
+		const CoordStruct ground = pCell->GetCoords();
+		const CoordStruct impact = pCell->GetCoordsWithBridge();
+
+		if (!e.bolts.empty())
+			GameCreate<AnimClass>(e.bolts[rng.RandomRanged(0, (int)e.bolts.size() - 1)],
+				ground, 0, 1, 0x600, 0, false);
+		if (!e.sounds.empty())
+			VocClass::PlayAt(e.sounds[rng.RandomRanged(0, (int)e.sounds.size() - 1)], ground);
+
+		RulesClass* R = RulesClass::Instance;
+		const int damage = e.damage != INT_MIN ? e.damage : (R ? R->LightningDamage : 0);
+		const bool hadContent = pCell->GetContent() != nullptr;
+		const LandType land = pCell->LandType;
+
+		AnimTypeClass* impactType = nullptr;
+		if (!e.impacts.empty())
+			impactType = e.impacts[rng.RandomRanged(0, (int)e.impacts.size() - 1)];
+		else if (!e.impactsSet && e.warhead)
+			impactType = MapClass::SelectDamageAnimation(damage, e.warhead, land, impact);
+		if (impactType)
+			GameCreate<AnimClass>(impactType, impact, 0, 1, 0x2600, 0, false);
+
+		if (e.warhead)
+		{
+			if (e.flash)
+				MapClass::FlashbangWarheadAt(damage, e.warhead, impact, false, SpotlightFlags::None);
+			if (damage != 0)
+				MapClass::DamageArea(impact, damage, nullptr, e.warhead, true, ps.owner);
+		}
+
+		// Vanilla scatters debris when the bolt hits bare hard ground (land
+		// types 1,3,4,11 with nothing there) or knocks something out.
+		const bool changed = hadContent != (pCell->GetContent() != nullptr);
+		const bool bare = !hadContent && (land == LandType::Road || land == LandType::Rock
+			|| land == LandType::Wall || land == LandType::Weeds);
+		if (!e.debris.empty() && e.debrisMax > 0 && (bare || changed) && !pCell->ContainsBridge())
+		{
+			const int n = rng.RandomRanged(e.debrisMin, e.debrisMax);
+			for (int i = 0; i < n; ++i)
+				GameCreate<AnimClass>(e.debris[rng.RandomRanged(0, (int)e.debris.size() - 1)],
+					impact, 0, 1, 0x600, 0, false);
+		}
+	}
+
+	void TickEffects()
+	{
+		const int now = Unsorted::CurrentFrame;
+		size_t w = 0;
+		for (size_t r = 0; r < PendingStrikes.size(); ++r)
+		{
+			PendingStrike ps = PendingStrikes[r];
+			const StrikeEffect& e = Effects[ps.fx];
+			if (!ps.triggered)
+			{
+				bool fire = false;
+				if (e.boltAt >= 0)
+					fire = now - ps.startFrame >= e.boltAt;
+				else if (!AnimAlive(ps.cloud))
+					fire = true; // cloud gone (or never made): strike now
+				else
+				{
+					const int frames = AnimFrames(ps.cloud);
+					const int at = ps.cloud->Animation.Value;
+					fire = e.boltAt == -1 ? (frames / 2 < at) : (frames - 1 <= at);
+				}
+				if (fire)
+				{
+					ps.triggered = true;
+					ps.nextBoltFrame = now;
+				}
+			}
+			if (ps.triggered)
+			{
+				while (ps.boltsLeft > 0 && now >= ps.nextBoltFrame)
+				{
+					DoBolt(e, ps);
+					--ps.boltsLeft;
+					ps.nextBoltFrame = now + std::max(1, e.boltEvery);
+					if (e.boltEvery > 0)
+						break;
+				}
+				if (ps.boltsLeft <= 0)
+				{
+					if (EffectLinesLeft > 0)
+					{
+						--EffectLinesLeft;
+						Debug::Log("[WeatherExt] frame %d: effect '%s' struck cell %d,%d "
+							"(%d frames after its cloud)\n", now, e.Name.c_str(),
+							ps.cell.X, ps.cell.Y, now - ps.startFrame);
+					}
+					continue; // done: drop it
+				}
+			}
+			PendingStrikes[w++] = ps;
+		}
+		PendingStrikes.resize(w);
+	}
+
+	// Weighted pick from a list (Strike.SW / Strike.Effect + their .Chances).
+	int PickWeighted(const std::vector<int>& items, const std::vector<int>& chances)
+	{
+		const int n = (int)items.size();
 		if (n == 0)
 			return -1;
 		if (n == 1)
-			return P.swIdx[0];
+			return items[0];
 		int total = 0;
 		for (int i = 0; i < n; ++i)
-			total += i < (int)P.chances.size() ? P.chances[i] : 1;
+			total += i < (int)chances.size() ? chances[i] : 1;
 		if (total <= 0)
-			return P.swIdx[0];
+			return items[0];
 		int roll = ScenarioClass::Instance->Random.RandomRanged(0, total - 1);
 		for (int i = 0; i < n; ++i)
 		{
-			roll -= i < (int)P.chances.size() ? P.chances[i] : 1;
+			roll -= i < (int)chances.size() ? chances[i] : 1;
 			if (roll < 0)
-				return P.swIdx[i];
+				return items[i];
 		}
-		return P.swIdx[n - 1];
+		return items[n - 1];
 	}
 
-	// Fire one shot (Strike.Count SWs) for the pool. Returns SWs launched.
+	// Fire one shot for the pool: Strike.Count times, each a picked SW and/or a
+	// picked strike effect. Returns the number of SWs launched + effects started.
 	int FirePoolShot(const PoolParams& P, int w)
 	{
 		long long count = P.count;
@@ -1289,10 +1634,21 @@ namespace
 		const bool eachHuman = _strcmpi(P.owner.c_str(), "each-human") == 0;
 		const bool eachPlayer = _strcmpi(P.owner.c_str(), "each-player") == 0;
 		int launched = 0;
+		auto fireFor = [&](HouseClass* pH, int sw, int fx) {
+			const CellStruct cell = PickTargetCell(P.target);
+			if (sw >= 0 && FireOneSW(pH, sw, P.grant, cell))
+				++launched;
+			if (fx >= 0)
+			{
+				StartEffect(fx, pH, cell);
+				++launched;
+			}
+		};
 		for (int k = 0; k < (int)count; ++k)
 		{
-			const int sw = PickPoolSW(P);
-			if (sw < 0)
+			const int sw = PickWeighted(P.swIdx, P.chances);
+			const int fx = PickWeighted(P.fxIdx, P.fxChances);
+			if (sw < 0 && fx < 0)
 				continue;
 			if (eachHuman || eachPlayer)
 			{
@@ -1303,12 +1659,11 @@ namespace
 						continue;
 					if (eachHuman && !pH->IsHumanPlayer)
 						continue;
-					if (FireOneSW(pH, sw, P.grant, PickTargetCell(P.target)))
-						++launched;
+					fireFor(pH, sw, fx);
 				}
 			}
-			else if (FireOneSW(ResolveFiringHouse(P.owner), sw, P.grant, PickTargetCell(P.target)))
-				++launched;
+			else
+				fireFor(ResolveFiringHouse(P.owner), sw, fx);
 		}
 		return launched;
 	}
@@ -1451,6 +1806,10 @@ namespace
 						m.Name.c_str(), s.swName.c_str());
 			}
 
+		// Strike effects: anim/sound/warhead names (defaults from [General]).
+		for (auto& e : Effects)
+			ResolveEffect(e);
+
 		// Resolve strike pools: meter names per pool, SW names per band.
 		anyPools = false;
 		for (auto& pool : Pools)
@@ -1477,6 +1836,22 @@ namespace
 					else
 					{
 						P.swIdx.push_back(idx);
+						anySW = true;
+					}
+				}
+			}
+			for (auto& P : pool.bands)
+			{
+				P.fxIdx.clear();
+				for (auto& n : P.fxNames)
+				{
+					auto it = EffectIndex.find(n);
+					if (it == EffectIndex.end())
+						Debug::Log("[WeatherExt] pool '%s' Strike.Effect names unknown "
+							"effect '%s'; skipped.\n", pool.Name.c_str(), n.c_str());
+					else
+					{
+						P.fxIdx.push_back(it->second);
 						anySW = true;
 					}
 				}
@@ -1694,6 +2069,46 @@ void Weather::ReadGlobals(CCINIClass* pINI)
 			ResetPoolRuntime(p);
 		}
 	}
+
+	// Strike effects (rev 5): every section a pool names in Strike.Effect
+	// (any band). Raw keys merge across passes like pools; an effect with no
+	// keys at all is the vanilla [General] weather-control strike.
+	{
+		std::vector<std::string> wanted;
+		for (auto& p : Pools)
+			for (auto& P : p.bands)
+				for (auto& n : P.fxNames)
+					if (std::find(wanted.begin(), wanted.end(), n) == wanted.end())
+						wanted.push_back(n);
+		for (auto& n : wanted)
+		{
+			auto it = EffectIndex.find(n);
+			if (it == EffectIndex.end())
+			{
+				StrikeEffect e;
+				e.Name = n;
+				Effects.push_back(std::move(e));
+				it = EffectIndex.emplace(n, (int)Effects.size() - 1).first;
+			}
+			StrikeEffect& e = Effects[it->second];
+			const int nk = pINI->GetKeyCount(n.c_str());
+			for (int i = 0; i < nk; ++i)
+			{
+				const char* k = pINI->GetKeyName(n.c_str(), i);
+				if (!k || !*k)
+					continue;
+				pINI->ReadString(n.c_str(), k, "", WeatherExtDLL::readBuffer, WeatherExtDLL::readLength);
+				e.raw[Lower(k)] = WeatherExtDLL::readBuffer;
+			}
+			StrikeEffect fresh;
+			fresh.Name = e.Name;
+			fresh.raw = std::move(e.raw);
+			ReadEffectKeys(fresh);
+			e = std::move(fresh);
+		}
+	}
+	PendingStrikes.clear();
+	EffectLinesLeft = 20;
 	MotionLinesLeft = 40;
 
 	logCounter = 0;
@@ -2102,6 +2517,10 @@ void Weather::FrameTick()
 	if (anyPools)
 		for (auto& pool : Pools)
 			TickPool(pool);
+
+	// --- strike effects in flight (clouds waiting to bolt) ---
+	if (!PendingStrikes.empty())
+		TickEffects();
 
 	// --- Effect: global cost multiplier (house-field approach) ---
 	// Re-drive each house's own cost recompute (HouseClass::CalculateCostMultipliers,
