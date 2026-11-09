@@ -149,12 +149,18 @@ namespace
 	}
 
 	// ---- meters -----------------------------------------------------------
+	// Max=-1 stands for "no top". The level is still an int, so it is held
+	// under this ceiling, far out of reach (10 per second = 3 years of game).
+	// Half of INT_MAX leaves headroom for sums of amounts and weight factors.
+	constexpr int METER_NO_TOP = INT_MAX / 2;
+
 	struct Meter
 	{
 		std::string Name;
 		int StartAmount = 0;
 		int Min = 0;
-		int Max = 100000;
+		int Max = 100000;     // Max=-1 => no top (NoTop, Max = METER_NO_TOP)
+		bool NoTop = false;
 		int Baseline = 0;
 		int Decay = 0;        // 0 => no drift
 		int DecayRate = 15;   // frames between drift ticks (>=1)
@@ -716,9 +722,10 @@ namespace
 		return it != MeterIndex.end() ? &Meters[it->second] : nullptr;
 	}
 
-	int ClampMeter(const Meter& m, int v)
+	// Takes a long long so `Amount + delta` near a no-top ceiling can't wrap.
+	int ClampMeter(const Meter& m, long long v)
 	{
-		return std::clamp(v, m.Min, m.Max);
+		return static_cast<int>(std::clamp(v, (long long)m.Min, (long long)m.Max));
 	}
 
 	int Scaled(int amount)
@@ -912,8 +919,8 @@ namespace
 
 		if (!atEdge())
 		{
-			int next = m.Amount + m.dir * d.step;
-			next = m.dir > 0 ? std::min(next, edge) : std::max(next, edge);
+			long long next = (long long)m.Amount + (long long)m.dir * d.step;
+			next = m.dir > 0 ? std::min(next, (long long)edge) : std::max(next, (long long)edge);
 			m.Amount = ClampMeter(m, next);
 		}
 		if (atEdge())
@@ -1068,7 +1075,8 @@ namespace
 
 		if ((v = get("Slots.PerWeight"))) p.perWeight = std::max(1, atoi(v->c_str()));
 		if ((v = get("Slots.Min"))) p.slotsMin = std::max(0, atoi(v->c_str()));
-		if ((v = get("Slots.Max"))) p.slotsMax = std::clamp(atoi(v->c_str()), 0, MAX_POOL_SLOTS);
+		if ((v = get("Slots.Max")))  // -1 => as many as the hard limit allows
+			p.slotsMax = atoi(v->c_str()) == -1 ? MAX_POOL_SLOTS : std::clamp(atoi(v->c_str()), 0, MAX_POOL_SLOTS);
 		if ((v = get("Slots.Delay"))) p.delay = ParseTimeFrames(v->c_str());
 		if ((v = get("Slots.NewReady"))) p.newReady = ParseBool(*v, p.newReady);
 		if ((v = get("Slots.Remove"))) p.removeNewest = _strcmpi(v->c_str(), "oldest") != 0;
@@ -1229,14 +1237,15 @@ namespace
 		for (size_t i = 0; i < p.sysIdx.size(); ++i)
 			if (p.sysIdx[i] >= 0)
 				w += p.factors[i] * Meters[p.sysIdx[i]].Amount;
-		return static_cast<int>(std::lround(w));
+		const double cap = METER_NO_TOP;
+		return static_cast<int>(std::lround(std::clamp(w, -cap, cap)));
 	}
 
 	long long ShaveBudget(const PoolParams& P, int w)
 	{
 		if (P.shaveC <= 0 || w <= P.shaveFrom)
 			return 0;
-		return P.shaveC * (long long)(w - P.shaveFrom) / P.shavePer;
+		return P.shaveC * ((long long)w - P.shaveFrom) / P.shavePer;
 	}
 
 	bool PatternSaturated(const PoolParams& P, Pattern pat, int w, int n)
@@ -2154,7 +2163,10 @@ void Weather::ReadGlobals(CCINIClass* pINI)
 		const char* s = m.Name.c_str();
 		m.StartAmount = pINI->ReadInteger(s, "StartAmount", m.StartAmount);
 		m.Min = pINI->ReadInteger(s, "Min", m.Min);
-		m.Max = pINI->ReadInteger(s, "Max", m.Max);
+		m.Max = pINI->ReadInteger(s, "Max", m.NoTop ? -1 : m.Max);
+		m.NoTop = (m.Max == -1);
+		if (m.NoTop)
+			m.Max = METER_NO_TOP;
 		m.Baseline = pINI->ReadInteger(s, "Baseline", m.Baseline);
 		m.Decay = pINI->ReadInteger(s, "Decay", m.Decay);
 		m.DecayRate = std::max(1, ReadTime(pINI, s, "DecayRate", m.DecayRate));
@@ -2329,10 +2341,11 @@ void Weather::ReadGlobals(CCINIClass* pINI)
 				DebugLines, DebugLines <= 0 ? " (unlimited)" : "", cats.c_str());
 		}
 		for (auto& m : Meters)
-			Debug::Log("[WeatherExt]   meter '%s': start=%d range=[%d,%d] "
+			Debug::Log("[WeatherExt]   meter '%s': start=%d range=[%d,%s] "
 				"baseline=%d decay=%d/%df fireSlots=%zu owner=%s motion=%d "
 				"(delay %df, climb %d/%df, decline %d/%df)\n",
-				m.Name.c_str(), m.StartAmount, m.Min, m.Max, m.Baseline,
+				m.Name.c_str(), m.StartAmount, m.Min,
+				m.NoTop ? "none" : std::to_string(m.Max).c_str(), m.Baseline,
 				m.Decay, m.DecayRate, m.fireSlots.size(), m.owner.c_str(),
 				m.StartMotion, m.MotionDelay, m.climb.step, m.climb.every,
 				m.decline.step, m.decline.every);
@@ -2471,7 +2484,7 @@ void Weather::OnDetonation(WarheadTypeClass* pWH, TechnoClass* pSource, HouseCla
 		if (delta == 0)
 			continue;
 		const int before = m.Amount;
-		m.Amount = ClampMeter(m, m.Amount + delta);
+		m.Amount = ClampMeter(m, (long long)m.Amount + delta);
 
 		if (before != m.Amount && Dbg(Cat::Contributors))
 		{
@@ -2515,7 +2528,7 @@ void Weather::OnSuperWeaponFired(HouseClass* pHouse, int swSlotIndex)
 		// START delta, now.
 		const int startDelta = Scaled(sc.start[i].amount);
 		if (startDelta != 0)
-			m.Amount = ClampMeter(m, m.Amount + startDelta);
+			m.Amount = ClampMeter(m, (long long)m.Amount + startDelta);
 
 		// FINISH delta: scaled at SCHEDULE time (a later WeatherScale change
 		// can't retroactively desync a pending finish).
@@ -2525,7 +2538,7 @@ void Weather::OnSuperWeaponFired(HouseClass* pHouse, int swSlotIndex)
 			if (sc.interval > 0)
 				pendingFinish.push_back({ Unsorted::CurrentFrame + sc.interval, idx, finishDelta });
 			else
-				m.Amount = ClampMeter(m, m.Amount + finishDelta); // same-frame
+				m.Amount = ClampMeter(m, (long long)m.Amount + finishDelta); // same-frame
 		}
 	}
 
@@ -2598,7 +2611,7 @@ void Weather::FrameTick()
 				if (p.meterIdx >= 0 && p.meterIdx < (int)Meters.size() && p.amount != 0)
 				{
 					Meter& m = Meters[p.meterIdx];
-					m.Amount = ClampMeter(m, m.Amount + p.amount);
+					m.Amount = ClampMeter(m, (long long)m.Amount + p.amount);
 				}
 			}
 			else
@@ -2658,7 +2671,7 @@ void Weather::FrameTick()
 					ApplyMotionCmd(m, c.motion);
 				const int delta = Scaled(c.amount);
 				if (delta != 0)
-					m.Amount = ClampMeter(m, m.Amount + delta);
+					m.Amount = ClampMeter(m, (long long)m.Amount + delta);
 			}
 		}
 	}
@@ -2688,10 +2701,11 @@ void Weather::FrameTick()
 			}
 
 			// effective interval shrinks (or grows) with overshoot, floored.
-			const int over = m.Amount - s.threshold;
-			const int steps = over / s.intervalStepAmount;
-			int interval = s.baseInterval + s.intervalStep * steps;
-			interval = std::max(interval, s.intervalMin);
+			const long long over = (long long)m.Amount - s.threshold;
+			const long long steps = over / s.intervalStepAmount;
+			const long long iv = std::clamp((long long)s.baseInterval + (long long)s.intervalStep * steps,
+				(long long)INT_MIN / 2, (long long)INT_MAX / 2);
+			const int interval = std::max(static_cast<int>(iv), s.intervalMin);
 
 			HouseClass* pHouse = ResolveFiringHouse(m.owner);
 			int launched = 0;

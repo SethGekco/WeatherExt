@@ -803,7 +803,8 @@ New keys on any meter in `[WeatherSystems]`. Motion is separate from `Decay`
 [WeatherStorm]
 StartAmount=100        ; where the storm starts          (StartingLevel*)
 Min=0                  ; hard clamps -- nothing goes outside these
-Max=5000
+Max=5000               ; -1 = no top: the level climbs forever (held under
+                       ; ~1.07 billion internally, out of reach in a match)
 
 Motion=climb           ; climb | decline | stable | random   start direction
 Motion.Delay=1m        ; no motion before this           (InitialDelay*)
@@ -855,7 +856,7 @@ Weight.Factors=1.0              ; per meter (default 1.0; negative allowed)
 ; --- Slots: how many strikes exist ---
 Slots.PerWeight=10              ; one slot per 10 Weight (Weight 250 -> 25 slots)
 Slots.Min=0                     ; floor once the pool is live
-Slots.Max=500                   ; ceiling
+Slots.Max=500                   ; ceiling; -1 = the hard limit (2000)
 Slots.Delay=0                   ; nothing fires before this game time
 Slots.NewReady=yes              ; a new slot fires at once (old InitialReady=yes)
 Slots.Remove=newest             ; newest | oldest -- which slot goes when Weight drops
