@@ -715,6 +715,8 @@ namespace
 		return HouseClass::FindByCountryName(owner.c_str());
 	}
 
+	CellStruct LastTargetCell{}; // for the fire log only
+
 	CellStruct PickTargetCell(TargetMode mode)
 	{
 		const auto& b = MapClass::Instance.MapCoordBounds;
@@ -726,10 +728,26 @@ namespace
 		}
 		else // Random -- synced RNG so every client picks the same cell
 		{
+			// MapCoordBounds is the bounding box of a DIAMOND in cell space, so
+			// a raw draw often lands off the playable map (or on no cell at
+			// all) and the strike is never seen. Redraw until the engine's own
+			// usable-area test (0x578460) accepts it; the map is identical on
+			// every client, so the number of draws is too.
 			auto& rng = ScenarioClass::Instance->Random;
-			cell.X = static_cast<short>(rng.RandomRanged(b.Left, b.Right));
-			cell.Y = static_cast<short>(rng.RandomRanged(b.Top, b.Bottom));
+			for (int tries = 0; tries < 64; ++tries)
+			{
+				cell.X = static_cast<short>(rng.RandomRanged(b.Left, b.Right));
+				cell.Y = static_cast<short>(rng.RandomRanged(b.Top, b.Bottom));
+				if (MapClass::Instance.IsWithinUsableArea(cell, true))
+				{
+					LastTargetCell = cell;
+					return cell;
+				}
+			}
+			cell.X = static_cast<short>((b.Left + b.Right) / 2);
+			cell.Y = static_cast<short>((b.Top + b.Bottom) / 2);
 		}
+		LastTargetCell = cell;
 		return cell;
 	}
 
@@ -1374,8 +1392,9 @@ namespace
 			{
 				--fireLinesLeft;
 				Debug::Log("[WeatherExt] frame %d: pool '%s' weight=%d slot %d/%d fired x%d "
-					"(%s, next in %df)\n", Unsorted::CurrentFrame, pool.Name.c_str(), w,
-					i + 1, n, launched, PatternName(pat), pool.timers[i]);
+					"(%s, next in %df) last target cell %d,%d\n", Unsorted::CurrentFrame,
+					pool.Name.c_str(), w, i + 1, n, launched, PatternName(pat), pool.timers[i],
+					LastTargetCell.X, LastTargetCell.Y);
 			}
 		}
 		if (last >= 0)
