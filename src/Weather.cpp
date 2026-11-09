@@ -738,13 +738,15 @@ namespace
 	// both apply. Returns false if the house can't field the SW.
 	bool FireOneSW(HouseClass* pHouse, int swIndex, bool grant, const CellStruct& cell)
 	{
-		if (!pHouse || swIndex < 0)
+		if (!pHouse || swIndex < 0 || swIndex >= pHouse->Supers.Count)
 			return false;
-		int idx = pHouse->FindSuperWeaponIndex(static_cast<SuperWeaponType>(swIndex));
-		if (idx < 0)
-			return false;
+		// A house holds one SuperClass per SuperWeaponTypeClass, in type-array
+		// order, so the TYPE index is the Supers index. (FindSuperWeaponIndex is
+		// NOT that lookup: it matches the built-in kind, Type->Type, so a custom
+		// SW's array index resolved to nothing or to another SW of that kind.)
+		const int idx = swIndex;
 		SuperClass* pSuper = pHouse->Supers.GetItem(idx);
-		if (!pSuper)
+		if (!pSuper || pSuper->Type != SuperWeaponTypeClass::Array.GetItem(swIndex))
 			return false;
 		if (grant)
 			pSuper->Grant(false, false, false); // permanent, silent, not on-hold
