@@ -1,3 +1,8 @@
+> **Merged into SuperWeaponExt (2026-11-10).** Weather now ships inside
+> SuperWeaponExt.dll; development continues in ~/Claude/SuperWeaponExt
+> (`src/Weather/`, manual at `docs/WEATHER_MANUAL.md`). This repo is kept for
+> history only.
+
 # WeatherExt
 
 Standalone Syringe DLL for Yuri's Revenge: one synced global **Weather Level**
